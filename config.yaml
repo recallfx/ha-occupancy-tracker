@@ -1,0 +1,104 @@
+areas:
+  main_bathroom:
+    name: Main Bathroom
+    indoors: true
+  main_bedroom:
+    name: Main Bedroom
+    indoors: true
+  back_hall:
+    name: back_Hall
+    indoors: true
+  front_hall:
+    name: front_Hall
+    indoors: true
+  entrance:
+    name: Entrance
+    indoors: true
+  living:
+    name: Living room
+    indoors: true
+  frontyard:
+    name: Front yard
+    indoors: false
+  backyard:
+    name: Back yard
+    indoors: false
+
+adjacency:
+  main_bathroom:
+    - main_bedroom
+    - backyard
+  main_bedroom:
+    - main_bathroom
+    - back_hall
+    - backyard
+  back_hall:
+    - main_bedroom
+    - front_hall
+    - frontyard    
+    - backyard
+  front_hall:
+    - back_hall
+    - entrance
+    - frontyard
+    - backyard
+  entrance:
+    - front_hall
+    - living
+    - frontyard
+    - backyard
+  living:
+    - entrance
+    - backyard
+  backyard:
+    - main_bathroom
+    - main_bedroom
+    - front_hall
+    - entrance
+    - living
+  frontyard:
+    - front_hall
+    - entrance
+    - backyard
+
+sensors:
+  motion_main_bathroom:
+    area: main_bathroom
+    type: motion
+  motion_main_bedroom:
+    area: main_bedroom
+    type: motion
+  motion_back_hall:
+    area: back_hall
+    type: motion
+  motion_front_hall:
+    area: front_hall
+    type: motion    
+  motion_entrance:
+    area: entrance
+    type: motion    
+  magnetic_therace:
+    area: 
+      - entrance
+      - backyard
+    type: magnetic
+  magnetic_entry:
+    area: 
+      - entrance
+      - frontyard
+    type: magnetic
+  motion_living:
+    area: living
+    type: motion
+  motion_front_left_camera:
+    area: frontyard
+    type: camera_motion
+  person_front_left_camera:
+    area: frontyard
+    type: camera_person
+  motion_back_left_camera:
+    area: backyard
+    type: camera_motion
+  person_back_left_camera:
+    area: backyard
+    type: camera_person
