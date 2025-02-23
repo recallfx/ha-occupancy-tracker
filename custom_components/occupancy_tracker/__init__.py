@@ -1,28 +1,27 @@
-"""Custom component for tracking occupancy across multiple areas using sensor fusion."""
+"""The occupancy_tracker integration."""
 
 import logging
 import time
 
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import (
-    async_track_state_change,
-    async_track_time_interval,
-)
+from homeassistant.helpers.event import async_track_state_change_event
 
-from custom_components.occupancy_tracker.occupancy_system import OccupancySystem
+from .occupancy_system import OccupancySystem
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "occupancy_tracker"
 
 
-async def async_setup(hass, config):
-    """Set up the Occupancy Tracker integration."""
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up the Occupancy Tracker integration from YAML configuration."""
     conf = config.get(DOMAIN)
     if conf is None:
         _LOGGER.error("No configuration found for occupancy_tracker")
         return False
 
-    # Build the occupancy configuration directly from HA's configuration.
+    # Build the occupancy system configuration from HA's YAML configuration.
     occupancy_config = {
         "areas": conf.get("areas", {}),
         "adjacency": conf.get("adjacency", {}),
@@ -38,41 +37,30 @@ async def async_setup(hass, config):
         short_threshold=short_threshold,
     )
 
-    # If a sensor_mapping is not provided, assume the sensor names are the HA entity IDs.
-    sensor_mapping = conf.get("sensor_mapping")
-    if not sensor_mapping:
-        sensor_mapping = {
-            sensor_name: sensor_name
-            for sensor_name in occupancy_config.get("sensors", {})
-        }
+    hass.data[DOMAIN] = {"occupancy_system": occupancy_system}
 
-    hass.data[DOMAIN] = {
-        "occupancy_system": occupancy_system,
-        "sensor_mapping": sensor_mapping,
-    }
+    async def state_change_listener(event: Event) -> None:
+        """Handle state changes for sensors."""
+        # Since sensor names are assumed to be the actual HA entity IDs,
+        # check if the changed entity is one of our sensors.
+        entity_id = event.data.get("entity_id")
+        new_state = event.data.get("new_state")
 
-    async def state_change_listener(entity_id, old_state, new_state):
-        # Look up which occupancy system sensor corresponds to this entity.
-        for occ_sensor, ha_entity in sensor_mapping.items():
-            if ha_entity == entity_id:
-                # Interpret HA state: 'on' becomes True; anything else is False.
-                sensor_state = new_state.state.lower() == "on" if new_state else False
-                timestamp = time.time()
-                occupancy_system.handle_event(
-                    occ_sensor, sensor_state, timestamp=timestamp
-                )
-                async_dispatcher_send(hass, f"{DOMAIN}_update")
-                break
+        sensors = occupancy_config.get("sensors", {})
+        if entity_id in sensors:
+            # Interpret HA state: 'on' becomes True; any other value is False
+            sensor_state = new_state.state.lower() == "on" if new_state else False
+            timestamp = time.time()
+            occupancy_system.handle_event(entity_id, sensor_state, timestamp=timestamp)
+            async_dispatcher_send(hass, f"{DOMAIN}_update")
 
-    # Set up state listeners for each HA sensor.
-    if sensor_mapping:
-        entity_ids = list(sensor_mapping.values())
-        async_track_state_change(hass, entity_ids, state_change_listener)
+    # Set up state listeners for each sensor entity defined in the occupancy config.
+    sensor_entities = list(occupancy_config.get("sensors", {}).keys())
+    if sensor_entities:
+        async_track_state_change_event(hass, sensor_entities, state_change_listener)
 
-    async def periodic_update(now):
-        async_dispatcher_send(hass, f"{DOMAIN}_update")
-
-    async_track_time_interval(hass, periodic_update, 30)
+    # Set up the sensor platform
+    await async_load_platform(hass, "sensor", DOMAIN, {}, config)
 
     _LOGGER.info("Occupancy Tracker integration set up successfully")
     return True
