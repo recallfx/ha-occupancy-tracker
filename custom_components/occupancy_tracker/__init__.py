@@ -61,6 +61,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # Set up the sensor platform
     await async_load_platform(hass, "sensor", DOMAIN, {}, config)
+    
+    # Set up the button platform
+    await async_load_platform(hass, "button", DOMAIN, {}, config)
 
     _LOGGER.info("Occupancy Tracker integration set up successfully")
     return True

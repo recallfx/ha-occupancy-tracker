@@ -107,6 +107,10 @@ class AnomalyDetector:
             # Update stored occupant count
             self.prev_occupant_count[area] = new_count
 
+    def reset_anomalies(self):
+        """Reset all detected anomalies."""
+        self.anomalies = []
+
     def get_anomalies(self):
         """Returns the list of anomalies detected so far."""
         return self.anomalies

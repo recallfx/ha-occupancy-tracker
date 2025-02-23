@@ -70,3 +70,7 @@ class OccupancySystem:
         :return: A list of anomaly records.
         """
         return self.anomaly_detector.get_anomalies()
+
+    def reset_anomalies(self):
+        """Reset all detected anomalies."""
+        self.anomaly_detector.reset_anomalies()
