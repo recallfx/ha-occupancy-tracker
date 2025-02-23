@@ -20,9 +20,11 @@ areas:
   frontyard:
     name: Front yard
     indoors: false
+    exit_capable: true
   backyard:
     name: Back yard
     indoors: false
+    exit_capable: true
 
 adjacency:
   main_bathroom:
@@ -56,6 +58,7 @@ adjacency:
     - front_hall
     - entrance
     - living
+    - frontyard
   frontyard:
     - front_hall
     - entrance
@@ -73,17 +76,17 @@ sensors:
     type: motion
   motion_front_hall:
     area: front_hall
-    type: motion    
+    type: motion
   motion_entrance:
     area: entrance
-    type: motion    
+    type: motion
   magnetic_therace:
-    area: 
+    area:
       - entrance
       - backyard
     type: magnetic
   magnetic_entry:
-    area: 
+    area:
       - entrance
       - frontyard
     type: magnetic

@@ -1,0 +1,14 @@
+{
+    "domain": "occupancy_tracker",
+    "name": "Occupancy Tracker",
+    "codeowners": ["@recallfx"],
+    "version": "0.1.0",
+    "documentation": "https://github.com/recallfx/occupancy_tracker/blob/master/README.md",
+    "issue_tracker": "https://github.com/recallfx/occupancy_tracker/issues",
+    "iot_class": "calculated",
+    "quality_scale": "bronze",
+    "requirements": [
+      "pyyaml==6.0.2"
+    ],
+    "dependencies": []
+  }
