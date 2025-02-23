@@ -57,22 +57,72 @@ class OccupancyProbabilitySensor(SensorEntity):
 
 
 class AnomalySensor(SensorEntity):
-    """Sensor for detected anomalies."""
+    """Sensor for detected anomalies. 
+    
+    Reports both the count of anomalies and detailed information including:
+    - Anomaly type (long_detection, impossible_appearance)
+    - Affected areas and sensors
+    - Timestamps and durations
+    - Additional context like occupancy counts
+    """
 
     def __init__(self, occupancy_system):
         self._occupancy_system = occupancy_system
         self._attr_name = "Detected Anomalies"
         self._attr_unique_id = "detected_anomalies"
+        self._attr_icon = "mdi:alert-circle"
 
     @property
     def state(self):
-        """Return the state of the sensor."""
+        """Return the count of detected anomalies."""
         return len(self._occupancy_system.get_anomalies())
 
     @property
     def extra_state_attributes(self):
-        """Return the state attributes."""
-        return {"anomalies": self._occupancy_system.get_anomalies()}
+        """Return detailed state attributes about anomalies.
+        
+        Returns:
+            dict: Contains:
+                - List of all anomalies with full details
+                - Count of each anomaly type
+                - Latest anomaly details
+                - Affected areas/sensors summary
+        """
+        anomalies = self._occupancy_system.get_anomalies()
+        
+        # Count anomalies by type
+        type_counts = {}
+        affected_areas = set()
+        affected_sensors = set()
+        
+        for anomaly in anomalies:
+            atype = anomaly.get("type", "unknown")
+            type_counts[atype] = type_counts.get(atype, 0) + 1
+            
+            if "area" in anomaly:
+                affected_areas.add(anomaly["area"])
+            if "sensor" in anomaly:
+                affected_sensors.add(anomaly["sensor"])
+
+        return {
+            "anomalies": anomalies,  # Full list of anomaly records
+            "anomaly_counts": type_counts,  # Count by type
+            "latest_anomaly": anomalies[-1] if anomalies else None,  # Most recent anomaly
+            "affected_areas": list(affected_areas),  # List of areas with anomalies
+            "affected_sensors": list(affected_sensors),  # List of sensors with anomalies
+            "total_affected_areas": len(affected_areas),
+            "total_affected_sensors": len(affected_sensors)
+        }
+
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return True
+
+    @property
+    def device_class(self) -> str:
+        """Return the device class."""
+        return "problem"
 
 
 class OccupiedInsideAreasSensor(SensorEntity):
