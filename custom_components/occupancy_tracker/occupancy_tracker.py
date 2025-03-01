@@ -39,7 +39,7 @@ class OccupancyTracker:
     def _initialize_sensors(self) -> None:
         """Initialize sensor tracking objects from configuration."""
         for sensor_id, sensor_config in self.config.get("sensors", {}).items():
-            self.sensors[sensor_id] = SensorState(sensor_id, sensor_config)
+            self.sensors[sensor_id] = SensorState(sensor_id, sensor_config, time.time())
 
     def _initialize_adjacency(self) -> None:
         """Initialize sensor adjacency relationships from configuration."""
