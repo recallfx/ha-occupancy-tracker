@@ -9,6 +9,7 @@ from .types import OccupancyTrackerConfig
 # Configure logger
 logger = logging.getLogger(__name__)
 
+
 class AnomalyDetector:
     """Detects anomalies in sensor readings and occupancy patterns."""
 
@@ -20,10 +21,10 @@ class AnomalyDetector:
         self.extended_occupancy_threshold = 12 * 3600  # 12 hours
 
     def check_for_stuck_sensors(
-        self, 
-        sensors: Dict[str, SensorState], 
+        self,
+        sensors: Dict[str, SensorState],
         areas: Dict[str, AreaState],
-        triggered_sensor_id: str, 
+        triggered_sensor_id: str,
     ) -> None:
         """Check for stuck sensors when a sensor is triggered."""
         triggered_sensor = sensors[triggered_sensor_id]
@@ -45,7 +46,7 @@ class AnomalyDetector:
         for sensor_id, sensor in sensors.items():
             if sensor.is_stuck() and sensor.is_reliable:
                 sensor_area = sensor.config.get("area", "unknown")
-                warning = self._create_warning(
+                self._create_warning(
                     "stuck_sensor",
                     f"Sensor {sensor_id} in area {sensor_area} may be stuck",
                     area=sensor_area,
@@ -55,15 +56,15 @@ class AnomalyDetector:
                 sensor.is_reliable = False
 
     def handle_unexpected_motion(
-        self, 
-        area: AreaState, 
+        self,
+        area: AreaState,
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
         timestamp: float,
-        adjacency_tracker
+        adjacency_tracker,
     ) -> bool:
         """Handle unexpected motion in an area that should be unoccupied.
-        
+
         Returns:
             bool: True if this is valid entry (not an anomaly), False if anomaly detected
         """
@@ -107,16 +108,16 @@ class AnomalyDetector:
                     f"Unexpected motion in {area.id} without clear entry path"
                 )
                 self._create_warning(
-                    "unexpected_motion", f"Unexpected motion in {area.id}", area=area.id, timestamp=timestamp
+                    "unexpected_motion",
+                    f"Unexpected motion in {area.id}",
+                    area=area.id,
+                    timestamp=timestamp,
                 )
 
         return valid_entry
 
     def check_simultaneous_motion(
-        self, 
-        trigger_area_id: str, 
-        areas: Dict[str, AreaState],
-        timestamp: float
+        self, trigger_area_id: str, areas: Dict[str, AreaState], timestamp: float
     ) -> None:
         """Check for simultaneous motion in multiple areas."""
         # Get list of areas with recent motion
@@ -188,6 +189,7 @@ class AnomalyDetector:
         """Add a warning to the system and return it."""
         if timestamp is None:
             import time
+
             timestamp = time.time()
         warning = Warning(warning_type, message, area, sensor_id, timestamp)
         logger.warning(f"New warning: {warning}")

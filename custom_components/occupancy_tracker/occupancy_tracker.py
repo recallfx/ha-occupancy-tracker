@@ -63,7 +63,9 @@ class OccupancyTracker:
             # Set adjacency for this sensor
             self.adjacency_tracker.set_adjacency(sensor_id, adjacent_sensors)
 
-    def process_sensor_event(self, sensor_id: str, state: bool, timestamp: float) -> None:
+    def process_sensor_event(
+        self, sensor_id: str, state: bool, timestamp: float
+    ) -> None:
         """Process a sensor state change event."""
         if sensor_id not in self.sensors:
             logger.warning(f"Unknown sensor ID: {sensor_id}")
@@ -173,7 +175,7 @@ class OccupancyTracker:
     def _handle_unexpected_motion(self, area: AreaState, timestamp: float) -> None:
         """Handle unexpected motion in an area that should be unoccupied."""
         # Delegate to anomaly detector to evaluate if this is a valid entry or anomaly
-        is_valid = self.anomaly_detector.handle_unexpected_motion(
+        self.anomaly_detector.handle_unexpected_motion(
             area, self.areas, self.sensors, timestamp, self.adjacency_tracker
         )
 
@@ -185,7 +187,9 @@ class OccupancyTracker:
     ) -> None:
         """Check for simultaneous motion in multiple areas."""
         # Delegate to anomaly detector to check for simultaneous motion anomalies
-        self.anomaly_detector.check_simultaneous_motion(trigger_area_id, self.areas, timestamp)
+        self.anomaly_detector.check_simultaneous_motion(
+            trigger_area_id, self.areas, timestamp
+        )
 
     def _add_warning(
         self,
@@ -207,10 +211,10 @@ class OccupancyTracker:
         if area_id not in self.areas:
             return 0
         return self.areas[area_id].occupancy
-    
+
     def get_occupancy_probability(self, area_id: str) -> float:
         """Get probability score (0-1) that area is occupied.
-        
+
         This is a simplified score based on occupancy count and recent activity:
         - 0.95 = Definitely occupied (recent motion + occupancy > 0)
         - 0.75 = Likely occupied (occupancy > 0 but no recent motion)
@@ -218,23 +222,25 @@ class OccupancyTracker:
         """
         if area_id not in self.areas:
             return 0.05
-            
+
         area = self.areas[area_id]
         now = time.time()
-        
+
         if area.occupancy <= 0:
             return 0.05
-            
+
         # If there's been motion in the last 5 minutes, high probability
         if now - area.last_motion < 300:
             return 0.95
-            
+
         # Occupied but no recent motion - slightly lower probability
         return 0.75
 
-    def check_timeouts(self) -> None:
+    def check_timeouts(self, timestamp: float = None) -> None:
         """Check for timeout conditions like inactivity and extended occupancy."""
-        self.anomaly_detector.check_timeouts(self.areas)
+        if timestamp is None:
+            timestamp = time.time()
+        self.anomaly_detector.check_timeouts(self.areas, timestamp)
 
     def resolve_warning(self, warning_id: str) -> bool:
         """Resolve a specific warning by ID."""
@@ -275,6 +281,12 @@ class OccupancyTracker:
             "last_event_time": self.last_event_time,
             "uptime": time.time() - self.last_event_time,
         }
+
+    def reset_anomalies(self) -> None:
+        """Reset the anomaly detection system without resetting occupancy state."""
+        # Create new anomaly detector (resetting warnings)
+        self.anomaly_detector = AnomalyDetector(self.config)
+        logger.info("Anomaly detection system reset")
 
     def reset(self) -> None:
         """Reset the entire system state."""

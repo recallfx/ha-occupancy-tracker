@@ -47,7 +47,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             # Interpret HA state: 'on' becomes True; any other value is False
             sensor_state = new_state.state.lower() == "on" if new_state else False
             timestamp = time.time()
-            occupancy_tracker.process_sensor_event(entity_id, sensor_state, timestamp=timestamp)
+            occupancy_tracker.process_sensor_event(
+                entity_id, sensor_state, timestamp=timestamp
+            )
             async_dispatcher_send(hass, f"{DOMAIN}_update")
 
     # Set up state listeners for each sensor entity defined in the occupancy config.
@@ -57,7 +59,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # Set up the sensor platform
     await async_load_platform(hass, "sensor", DOMAIN, {}, config)
-    
+
     # Set up the button platform
     await async_load_platform(hass, "button", DOMAIN, {}, config)
 

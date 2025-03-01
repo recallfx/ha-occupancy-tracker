@@ -125,7 +125,7 @@ sensors:
 The project includes comprehensive test suites:
 - `test_occupancy_tracker.py`: Core movement and transition logic
 - `test_anomaly_detector.py`: Anomaly detection validation
-- `test_occupancy_system.py`: Integrated system behavior
+- `test_occupancy_tracker.py`: Integrated system behavior
 - `test_config_validator.py`: Configuration validation
 
 ### Configuration Validation
