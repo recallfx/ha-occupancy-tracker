@@ -60,7 +60,7 @@ class AnomalySensor(SensorEntity):
     """Sensor for detected anomalies. 
     
     Reports both the count of anomalies and detailed information including:
-    - Anomaly type (long_detection, impossible_appearance)
+    - Anomaly type (stuck_sensor, unexpected_motion, simultaneous_motion, etc.)
     - Affected areas and sensors
     - Timestamps and durations
     - Additional context like occupancy counts
@@ -75,7 +75,7 @@ class AnomalySensor(SensorEntity):
     @property
     def state(self):
         """Return the count of detected anomalies."""
-        return len(self._occupancy_system.get_anomalies())
+        return len(self._occupancy_system.get_warnings(active_only=True))
 
     @property
     def extra_state_attributes(self):
@@ -88,7 +88,25 @@ class AnomalySensor(SensorEntity):
                 - Latest anomaly details
                 - Affected areas/sensors summary
         """
-        anomalies = self._occupancy_system.get_anomalies()
+        warnings = self._occupancy_system.get_warnings(active_only=True)
+        
+        # Convert warnings to dictionary representation
+        anomalies = []
+        for warning in warnings:
+            anomaly = {
+                "id": warning.id,
+                "type": warning.type,
+                "message": warning.message,
+                "timestamp": warning.timestamp,
+                "is_active": warning.is_active
+            }
+            
+            if warning.area:
+                anomaly["area"] = warning.area
+            if warning.sensor_id:
+                anomaly["sensor"] = warning.sensor_id
+                
+            anomalies.append(anomaly)
         
         # Count anomalies by type
         type_counts = {}

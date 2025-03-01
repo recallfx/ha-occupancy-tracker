@@ -8,7 +8,7 @@ from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event
 
-from .occupancy_system import OccupancySystem
+from .occupancy_tracker import OccupancyTracker
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "occupancy_tracker"
@@ -27,17 +27,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         "adjacency": conf.get("adjacency", {}),
         "sensors": conf.get("sensors", {}),
     }
-    long_detect_threshold = conf.get("long_detect_threshold", 300)
-    short_threshold = conf.get("short_threshold", 5)
 
     # Create the occupancy system instance.
-    occupancy_system = OccupancySystem(
+    occupancy_tracker = OccupancyTracker(
         occupancy_config,
-        long_detect_threshold=long_detect_threshold,
-        short_threshold=short_threshold,
     )
 
-    hass.data[DOMAIN] = {"occupancy_system": occupancy_system}
+    hass.data[DOMAIN] = {"occupancy_tracker": occupancy_tracker}
 
     async def state_change_listener(event: Event) -> None:
         """Handle state changes for sensors."""
@@ -51,7 +47,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             # Interpret HA state: 'on' becomes True; any other value is False
             sensor_state = new_state.state.lower() == "on" if new_state else False
             timestamp = time.time()
-            occupancy_system.handle_event(entity_id, sensor_state, timestamp=timestamp)
+            occupancy_tracker.process_sensor_event(entity_id, sensor_state, timestamp=timestamp)
             async_dispatcher_send(hass, f"{DOMAIN}_update")
 
     # Set up state listeners for each sensor entity defined in the occupancy config.

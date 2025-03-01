@@ -1,160 +1,298 @@
+import time
+import logging
+
+from typing import Dict, List, Optional, Any
+
+from .components.sensor_state import SensorState
+from .components.area_state import AreaState
+from .components.sensor_adjacency_tracker import SensorAdjacencyTracker
+from .components.warning import Warning
+from .components.types import OccupancyTrackerConfig
+from .components.anomaly_detector import AnomalyDetector
+
+# Configure logger
+logger = logging.getLogger(__name__)
+
+
 class OccupancyTracker:
-    def __init__(self, config):
+    """Main class for tracking occupancy across multiple areas."""
+
+    def __init__(self, config: OccupancyTrackerConfig):
         self.config = config
-        self.adjacency = config.get("adjacency", {})
-        self.sensors = config.get("sensors", {})
+        self.areas: Dict[str, AreaState] = {}
+        self.sensors: Dict[str, SensorState] = {}
+        self.last_event_time = time.time()
+        self.recent_motion_window = 120  # 2 minutes
+        self.adjacency_tracker = SensorAdjacencyTracker()
+        self.anomaly_detector = AnomalyDetector(config)
 
-        self.occupant_count = {}
-        self.occupant_prob = {}
-        # Track last motion time for adjacency checks
-        self.last_motion_time = {}
-        for area in config.get("areas", {}):
-            self.occupant_count[area] = 0.0
-            self.occupant_prob[area] = 0.05
-            self.last_motion_time[area] = None
+        # Initialize area and sensor objects
+        self._initialize_areas()
+        self._initialize_sensors()
+        self._initialize_adjacency()
 
-        # short time threshold to interpret quick adjacency transitions
-        self.short_threshold = 5
+    def _initialize_areas(self) -> None:
+        """Initialize area tracking objects from configuration."""
+        for area_id, area_config in self.config.get("areas", {}).items():
+            self.areas[area_id] = AreaState(area_id, area_config)
 
-    def set_occupancy(self, area, count):
-        self.occupant_count[area] = float(count)
-        self.occupant_prob[area] = 0.95 if count > 0 else 0.05
+    def _initialize_sensors(self) -> None:
+        """Initialize sensor tracking objects from configuration."""
+        for sensor_id, sensor_config in self.config.get("sensors", {}).items():
+            self.sensors[sensor_id] = SensorState(sensor_id, sensor_config)
 
-    def get_occupancy(self, area):
-        return self.occupant_count.get(area, 0.0)
+    def _initialize_adjacency(self) -> None:
+        """Initialize sensor adjacency relationships from configuration."""
+        adjacency_config = self.config.get("adjacency", {})
 
-    def get_occupancy_probability(self, area):
-        return self.occupant_prob.get(area, 0.05)
+        # Build adjacency map for sensors based on their areas
+        for sensor_id, sensor in self.sensors.items():
+            area_id = sensor.config.get("area")
+            if not area_id:
+                continue
 
-    def updateTimestamp(self, new_time):
-        # By default, no time-based occupant removal unless triggered by sensor logic
-        pass
+            # Find sensors in adjacent areas
+            adjacent_areas = adjacency_config.get(area_id, [])
+            adjacent_sensors = set()
 
-    def process_event(self, sensor_name, state, timestamp=0):
-        sensor_info = self.sensors.get(sensor_name)
-        if not sensor_info:
+            for adjacent_area_id in adjacent_areas:
+                for other_sensor_id, other_sensor in self.sensors.items():
+                    if other_sensor.config.get("area") == adjacent_area_id:
+                        adjacent_sensors.add(other_sensor_id)
+
+            # Set adjacency for this sensor
+            self.adjacency_tracker.set_adjacency(sensor_id, adjacent_sensors)
+
+    def process_sensor_event(self, sensor_id: str, state: bool, timestamp: float) -> None:
+        """Process a sensor state change event."""
+        if sensor_id not in self.sensors:
+            logger.warning(f"Unknown sensor ID: {sensor_id}")
             return
 
-        sensor_type = sensor_info.get("type")
-        sensor_areas = sensor_info.get("area")
-        if isinstance(sensor_areas, str):
-            sensor_areas = [sensor_areas]
+        sensor = self.sensors[sensor_id]
+        state_changed = sensor.update_state(state)
 
-        if sensor_type in ["motion", "camera_motion", "camera_person"]:
-            if state:
-                self._handle_motion_start(sensor_areas, timestamp)
-            else:
-                self._handle_motion_stop(sensor_areas, timestamp)
+        # Skip processing if state didn't actually change
+        if not state_changed and state is True:
+            # Only motion sensors have meaningful repeated "ON" states
+            if sensor.config.get("type", "") in [
+                "motion",
+                "camera_motion",
+                "camera_person",
+            ]:
+                self._process_repeated_motion(sensor_id, timestamp)
+            return
+
+        # Process different sensor types
+        sensor_type = sensor.config.get("type", "")
+
+        if sensor_type in ["motion", "camera_motion", "camera_person"] and state:
+            self._process_motion_event(sensor_id, timestamp)
+
         elif sensor_type == "magnetic":
-            if state:
-                self._handle_magnetic_trigger(sensor_areas, timestamp)
+            self._process_magnetic_event(sensor_id, state, timestamp)
 
-    def _handle_motion_start(self, areas, timestamp):
-        for area in areas:
-            self.last_motion_time[area] = timestamp
+        # Check for stuck sensors after processing the event
+        self._check_for_stuck_sensors(sensor_id, timestamp)
 
-            # If occupant_count(area) is 0 => see if occupant can come from adjacency
-            if self.occupant_count[area] == 0.0:
-                self._try_move_in(area, timestamp)
-            else:
-                # occupant already present => bump probability
-                self.occupant_prob[area] = 0.95
+        self.last_event_time = timestamp
 
-    def _handle_motion_stop(self, areas, timestamp):
-        """If occupant is in an exit-capable area and motion stops,
-        we might interpret that occupant as having left the system.
-        Or if there's an old area with occupant_count >=1, we degrade probability slightly.
-        """
-        for area in areas:
-            occ = self.occupant_count[area]
-            if occ >= 1:
-                # drop prob from 0.95 to something lower but not 0
-                if self.occupant_prob[area] > 0.5:
-                    self.occupant_prob[area] = 0.75
+    def _check_for_stuck_sensors(
+        self, triggered_sensor_id: str, timestamp: float
+    ) -> None:
+        """Check for stuck sensors when a sensor is triggered."""
+        triggered_sensor = self.sensors[triggered_sensor_id]
+        area_id = triggered_sensor.config.get("area")
 
-                # If this area is outdoors (and marked exit_capable in config) => occupant leaves
-                if self._area_is_exit_capable(area):
-                    # occupant presumably left
-                    self.occupant_count[area] = 0.0
-                    self.occupant_prob[area] = 0.05
-            # if occupant_count < 1 => do nothing special
-
-    def _handle_magnetic_trigger(self, areas, timestamp):
-        """For a sensor bridging two areas (e.g. entrance <-> backyard),
-        if there's occupant(s) in one side, we move exactly one occupant to the other side.
-        Additional triggers can move more occupants if multiple are present.
-        """
-        if len(areas) == 1:
-            # treat like a single motion sensor
-            self._handle_motion_start(areas, timestamp)
+        if not area_id or area_id not in self.areas:
             return
 
-        areaA, areaB = areas
-        countA = self.occupant_count[areaA]
-        countB = self.occupant_count[areaB]
+        # Record motion in adjacency tracker
+        self.adjacency_tracker.record_motion(area_id, timestamp)
 
-        if countA >= 1:
-            # move 1 occupant from A to B
-            self.occupant_count[areaA] = countA - 1
-            self.occupant_count[areaB] = countB + 1
-            self.occupant_prob[areaA] = 0.95 if self.occupant_count[areaA] > 0 else 0.05
-            self.occupant_prob[areaB] = 0.95
-        elif countB >= 1:
-            # move 1 occupant from B to A
-            self.occupant_count[areaB] = countB - 1
-            self.occupant_count[areaA] = countA + 1
-            self.occupant_prob[areaB] = 0.95 if self.occupant_count[areaB] > 0 else 0.05
-            self.occupant_prob[areaA] = 0.95
-        # no occupant on either side => interpret as 1 occupant arrives from outside?
-        # to keep it simpler, do a +1 occupant on side A or partial.
-        # We'll do: occupant_count[A] = 1 if both are 0
-        elif countA == 0 and countB == 0:
-            self.occupant_count[areaA] = 1
-            self.occupant_prob[areaA] = 0.95
-
-    def _try_move_in(self, new_area, timestamp):
-        """Attempt to move occupant from an adjacent area if time is short.
-        If no occupant is adjacent, we interpret it as a new occupant arriving.
-        """
-        adj_list = self.adjacency.get(new_area, [])
-        best_candidate = None
-        best_dt = None
-
-        for old_area in adj_list:
-            old_count = self.occupant_count[old_area]
-            if old_count > 0:
-                dt = abs(timestamp - (self.last_motion_time[old_area] or 0))
-                if best_candidate is None or dt < best_dt:
-                    best_candidate = old_area
-                    best_dt = dt
-
-        # if no candidate => occupant_count(new_area)=1
-        if not best_candidate:
-            self.occupant_count[new_area] = 1.0
-            self.occupant_prob[new_area] = 0.95
-            return
-
-        # if candidate found but dt is large => occupant_count(new_area)=1
-        if best_dt is None or best_dt > self.short_threshold:
-            self.occupant_count[new_area] = 1.0
-            self.occupant_prob[new_area] = 0.95
-            return
-
-        # occupant_count(best_candidate) >= 1 => move exactly 1 occupant
-        self.occupant_count[best_candidate] -= 1
-        self.occupant_count[best_candidate] = max(
-            self.occupant_count[best_candidate], 0
-        )
-        self.occupant_prob[best_candidate] = (
-            0.95 if self.occupant_count[best_candidate] > 0 else 0.05
+        # Delegate to anomaly detector for checking stuck sensors
+        self.anomaly_detector.check_for_stuck_sensors(
+            self.sensors, self.areas, triggered_sensor_id
         )
 
-        self.occupant_count[new_area] = self.occupant_count[new_area] + 1
-        self.occupant_prob[new_area] = 0.95
+    def _process_repeated_motion(self, sensor_id: str, timestamp: float) -> None:
+        """Handle repeated motion events from the same sensor."""
+        sensor = self.sensors[sensor_id]
+        area_id = sensor.config.get("area")
 
-    def _area_is_exit_capable(self, area):
-        """If your config.yaml or code designates certain areas (frontyard/backyard) as exit_capable,
-        we can automatically remove occupant from the system once motion is cleared.
+        if not area_id or area_id not in self.areas:
+            return
+
+        # Record motion in the area
+        self.areas[area_id].record_motion(timestamp)
+
+        # Update motion in adjacency tracker
+        self.adjacency_tracker.record_motion(area_id, timestamp)
+
+    def _process_motion_event(self, sensor_id: str, timestamp: float) -> None:
+        """Process motion sensor activation."""
+        sensor = self.sensors[sensor_id]
+        area_id = sensor.config.get("area")
+
+        if not area_id or area_id not in self.areas:
+            logger.warning(f"Sensor {sensor_id} is not associated with a valid area")
+            return
+
+        area = self.areas[area_id]
+
+        # Record motion in the area
+        area.record_motion(timestamp)
+
+        # Record motion in adjacency tracker
+        self.adjacency_tracker.record_motion(area_id, timestamp)
+
+        # Check for unexpected motion
+        if area.occupancy == 0:
+            self._handle_unexpected_motion(area, timestamp)
+
+        # Check for simultaneous motion in adjacent areas
+        self._check_simultaneous_motion(area_id, timestamp)
+
+    def _process_magnetic_event(
+        self, sensor_id: str, state: bool, timestamp: float
+    ) -> None:
+        """Process door/window sensor events."""
+        sensor = self.sensors[sensor_id]
+        between_areas = sensor.config.get("between_areas", [])
+
+        if len(between_areas) != 2:
+            logger.warning(
+                f"Magnetic sensor {sensor_id} has invalid between_areas configuration"
+            )
+            return
+
+        # Door/window events are generally just recorded but don't directly change occupancy
+        # They help confirm transitions between areas
+        # Full transition logic is handled by motion events before/after door events
+
+    def _handle_unexpected_motion(self, area: AreaState, timestamp: float) -> None:
+        """Handle unexpected motion in an area that should be unoccupied."""
+        # Delegate to anomaly detector to evaluate if this is a valid entry or anomaly
+        is_valid = self.anomaly_detector.handle_unexpected_motion(
+            area, self.areas, self.sensors, timestamp, self.adjacency_tracker
+        )
+
+        # Increment occupancy (even if anomaly since someone is likely still there)
+        area.record_entry(timestamp)
+
+    def _check_simultaneous_motion(
+        self, trigger_area_id: str, timestamp: float
+    ) -> None:
+        """Check for simultaneous motion in multiple areas."""
+        # Delegate to anomaly detector to check for simultaneous motion anomalies
+        self.anomaly_detector.check_simultaneous_motion(trigger_area_id, self.areas, timestamp)
+
+    def _add_warning(
+        self,
+        warning_type: str,
+        message: str,
+        area: Optional[str] = None,
+        sensor_id: Optional[str] = None,
+    ) -> None:
+        """Add a warning to the system."""
+        # This method is kept for compatibility but delegates to anomaly detector
+        self.anomaly_detector._create_warning(warning_type, message, area, sensor_id)
+
+    def get_warnings(self, active_only: bool = True) -> List[Warning]:
+        """Get list of warnings, optionally filtered to active ones only."""
+        return self.anomaly_detector.get_warnings(active_only)
+
+    def get_occupancy(self, area_id: str) -> int:
+        """Get current occupancy count for an area."""
+        if area_id not in self.areas:
+            return 0
+        return self.areas[area_id].occupancy
+    
+    def get_occupancy_probability(self, area_id: str) -> float:
+        """Get probability score (0-1) that area is occupied.
+        
+        This is a simplified score based on occupancy count and recent activity:
+        - 0.95 = Definitely occupied (recent motion + occupancy > 0)
+        - 0.75 = Likely occupied (occupancy > 0 but no recent motion)
+        - 0.05 = Likely unoccupied (no recorded occupancy)
         """
-        area_config = self.config.get("areas", {}).get(area, {})
-        return area_config.get("exit_capable", False)
+        if area_id not in self.areas:
+            return 0.05
+            
+        area = self.areas[area_id]
+        now = time.time()
+        
+        if area.occupancy <= 0:
+            return 0.05
+            
+        # If there's been motion in the last 5 minutes, high probability
+        if now - area.last_motion < 300:
+            return 0.95
+            
+        # Occupied but no recent motion - slightly lower probability
+        return 0.75
+
+    def check_timeouts(self) -> None:
+        """Check for timeout conditions like inactivity and extended occupancy."""
+        self.anomaly_detector.check_timeouts(self.areas)
+
+    def resolve_warning(self, warning_id: str) -> bool:
+        """Resolve a specific warning by ID."""
+        return self.anomaly_detector.resolve_warning(warning_id)
+
+    def get_area_status(self, area_id: str) -> Dict[str, Any]:
+        """Get detailed status information for an area."""
+        if area_id not in self.areas:
+            return {"error": "Area not found"}
+
+        area = self.areas[area_id]
+        now = time.time()
+        return {
+            "id": area_id,
+            "name": area.config.get("name", area_id),
+            "occupancy": area.occupancy,
+            "last_motion": area.last_motion,
+            "time_since_motion": now - area.last_motion
+            if area.last_motion > 0
+            else None,
+            "indoors": area.is_indoors,
+            "exit_capable": area.is_exit_capable,
+            "adjacent_areas": self.config.get("adjacency", {}).get(area_id, []),
+        }
+
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get overall system status information."""
+        occupied_areas = [
+            (area_id, area.occupancy)
+            for area_id, area in self.areas.items()
+            if area.occupancy > 0
+        ]
+
+        return {
+            "total_occupancy": sum(occ for _, occ in occupied_areas),
+            "occupied_areas": dict(occupied_areas),
+            "active_warnings": len(self.get_warnings(active_only=True)),
+            "last_event_time": self.last_event_time,
+            "uptime": time.time() - self.last_event_time,
+        }
+
+    def reset(self) -> None:
+        """Reset the entire system state."""
+        for area in self.areas.values():
+            area.occupancy = 0
+            area.last_motion = 0
+            area.activity_history = []
+
+        for sensor in self.sensors.values():
+            sensor.current_state = False
+            sensor.history = []
+            sensor.is_reliable = True
+
+        # Reset adjacency tracker
+        self.adjacency_tracker = SensorAdjacencyTracker()
+        self._initialize_adjacency()
+
+        # Create new anomaly detector (resetting warnings)
+        self.anomaly_detector = AnomalyDetector(self.config)
+
+        logger.info("Occupancy tracker system reset")
