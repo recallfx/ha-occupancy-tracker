@@ -55,11 +55,23 @@ sensors:
 
 2. Install and restart Home Assistant
 
+3. Add configuration to your `configuration.yaml`:
+   ```yaml
+   occupancy_tracker:
+     areas:
+       # Your area definitions here
+     adjacency:
+       # Your adjacency map here
+     sensors:
+       # Your sensor definitions here
+   ```
+
 ## Installation (manual)
 
 1. Download latest release
 2. Copy to `custom_components/occupancy_tracker`
 3. Restart Home Assistant
+4. Add configuration to `configuration.yaml` as shown above
 
 ## Usage Example
 
@@ -113,6 +125,57 @@ sensors:
 - Exit-capable areas excluded from impossible appearance detection
 - Transitions validated against adjacency map
 
+### Entity Types Provided
+- **Occupancy Sensors**: Binary sensors indicating presence in each area
+- **Probability Sensors**: Numeric sensors (0.05-0.95) indicating confidence level
+- **Warning Sensors**: Text sensors showing any detected anomalies
+- **Reset Button**: Entity to reset the system or clear warnings
+
+## System Components
+
+### OccupancyTracker
+The core system that processes sensor events, tracks occupancy across areas, and manages the system state.
+
+### AreaState
+Manages the state of each configured area including:
+- Current occupancy count
+- Last motion timestamp
+- Whether the area is exit-capable
+- Activity history
+
+### SensorState
+Tracks individual sensor states including:
+- Current state (active/inactive)
+- History of activations
+- Reliability metrics
+- Areas the sensor covers
+
+### AnomalyDetector
+Responsible for detecting unusual patterns:
+- Stuck sensors
+- Impossible appearances
+- Suspicious transitions
+- Simultaneous multi-area motion
+
+### SensorAdjacencyTracker
+Manages relationships between sensors and areas:
+- Tracks motion across adjacent areas
+- Validates transitions based on adjacency map
+- Records motion history for anomaly detection
+
+## Handling Special Cases
+
+### Sleep Scenarios
+The system maintains occupancy even during extended periods without motion, allowing for accurate tracking during sleep or sedentary activities.
+
+### Multi-Occupant Homes
+Tracks individual occupants moving between spaces with distinct probability scores for reliable family tracking.
+
+### Resetting the System
+Two reset options are available:
+- **Reset Anomalies**: Clears warnings without affecting occupancy state
+- **Full Reset**: Resets all occupancy counts, sensor states, and warnings
+
 ## Development
 
 ### Requirements
@@ -125,7 +188,7 @@ sensors:
 The project includes comprehensive test suites:
 - `test_occupancy_tracker.py`: Core movement and transition logic
 - `test_anomaly_detector.py`: Anomaly detection validation
-- `test_occupancy_tracker.py`: Integrated system behavior
+- `test_sensor_adjacency_tracker.py`: Adjacency mapping validation
 - `test_config_validator.py`: Configuration validation
 
 ### Configuration Validation
