@@ -8,6 +8,7 @@ from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event
 
+from .components.types import OccupancyTrackerConfig
 from .occupancy_tracker import OccupancyTracker
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         return False
 
     # Build the occupancy system configuration from HA's YAML configuration.
-    occupancy_config = {
+    occupancy_config: OccupancyTrackerConfig = {
         "areas": conf.get("areas", {}),
         "adjacency": conf.get("adjacency", {}),
         "sensors": conf.get("sensors", {}),

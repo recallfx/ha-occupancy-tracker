@@ -14,6 +14,10 @@ class SensorAdjacencyTracker:
         """Define which sensors are adjacent to a given sensor."""
         self.adjacency_map[sensor_id] = adjacent_sensor_ids
 
+    def get_adjacency(self, sensor_id: str) -> Set[str]:
+        """Get the set of sensors adjacent to a given sensor."""
+        return self.adjacency_map.get(sensor_id, set())
+
     def record_motion(self, area_id: str, timestamp: float) -> None:
         """Record motion in an area."""
         self.motion_times[area_id] = timestamp
