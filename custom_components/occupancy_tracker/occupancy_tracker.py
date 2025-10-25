@@ -51,6 +51,9 @@ class OccupancyTracker:
             if not area_id:
                 continue
 
+            # Register sensor-to-area mapping
+            self.adjacency_tracker.set_sensor_area(sensor_id, area_id)
+
             # Find sensors in adjacent areas
             adjacent_areas = adjacency_config.get(area_id, [])
             adjacent_sensors = set()
@@ -189,11 +192,13 @@ class OccupancyTracker:
     def _handle_unexpected_motion(self, area: AreaState, timestamp: float) -> None:
         """Handle unexpected motion in an area that should be unoccupied."""
         # Delegate to anomaly detector to evaluate if this is a valid entry or anomaly
-        self.anomaly_detector.handle_unexpected_motion(
+        valid_entry = self.anomaly_detector.handle_unexpected_motion(
             area, self.areas, self.sensors, timestamp, self.adjacency_tracker
         )
 
-        # Increment occupancy (even if anomaly since someone is likely still there)
+        # Always increment occupancy - if valid_entry is True, the person moved from
+        # an adjacent area (which was decremented). If False, it's a new entry or anomaly.
+        # Either way, someone is now in this area.
         area.record_entry(timestamp)
 
     def _check_simultaneous_motion(

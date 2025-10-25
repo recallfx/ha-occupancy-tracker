@@ -45,8 +45,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         sensors = occupancy_config.get("sensors", {})
         if entity_id in sensors:
+            # Handle sensor unavailability
+            if new_state is None or new_state.state in ["unavailable", "unknown"]:
+                _LOGGER.warning(
+                    f"Sensor {entity_id} is unavailable or in unknown state, skipping event"
+                )
+                return
+            
             # Interpret HA state: 'on' becomes True; any other value is False
-            sensor_state = new_state.state.lower() == "on" if new_state else False
+            sensor_state = new_state.state.lower() == "on"
             timestamp = time.time()
             occupancy_tracker.process_sensor_event(
                 entity_id, sensor_state, timestamp=timestamp

@@ -40,11 +40,27 @@ class AnomalyDetector:
         for adjacent_area_id in adjacency:
             for sensor_id, sensor in sensors.items():
                 if sensor.config.get("area") == adjacent_area_id:
-                    sensor.record_adjacent_motion(area_id)
+                    sensor.record_adjacent_motion(area_id, triggered_sensor.last_update_time)
 
-        # Check if sensors are stuck
+        # Check if sensors are stuck - need to calculate first!
         for sensor_id, sensor in sensors.items():
-            if sensor.is_stuck() and sensor.is_reliable:
+            # Get adjacent areas for this sensor's area
+            sensor_area = sensor.config.get("area")
+            if not sensor_area:
+                continue
+            
+            # Check if there was recent motion in adjacent areas
+            sensor_adjacency = self.config.get("adjacency", {}).get(sensor_area, [])
+            has_recent_adjacent_motion = any(
+                areas.get(adj_area_id) and 
+                areas[adj_area_id].has_recent_motion(triggered_sensor.last_update_time, 60)
+                for adj_area_id in sensor_adjacency
+            )
+            
+            # Now calculate if stuck
+            is_stuck = sensor.calculate_is_stuck(has_recent_adjacent_motion, triggered_sensor.last_update_time)
+            
+            if is_stuck and sensor.is_reliable:
                 sensor_area = sensor.config.get("area", "unknown")
                 self._create_warning(
                     "stuck_sensor",
