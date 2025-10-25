@@ -1,7 +1,7 @@
 """Tests for sensor platform."""
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock
 
 from custom_components.occupancy_tracker.sensor import (
     OccupancyCountSensor,
@@ -111,7 +111,7 @@ class TestAnomalySensor:
     def test_sensor_state_only_active_anomalies(self, tracker):
         """Test sensor state counts only active anomalies."""
         w1 = tracker.anomaly_detector._create_warning("type1", "Message 1")
-        w2 = tracker.anomaly_detector._create_warning("type2", "Message 2")
+        tracker.anomaly_detector._create_warning("type2", "Message 2")
 
         w1.resolve()
 
@@ -156,9 +156,13 @@ class TestAnomalySensor:
         """Test latest anomaly in attributes."""
         import time
 
-        tracker.anomaly_detector._create_warning("type1", "First", timestamp=time.time())
+        tracker.anomaly_detector._create_warning(
+            "type1", "First", timestamp=time.time()
+        )
         time.sleep(0.01)
-        tracker.anomaly_detector._create_warning("type2", "Second", timestamp=time.time())
+        tracker.anomaly_detector._create_warning(
+            "type2", "Second", timestamp=time.time()
+        )
 
         sensor = AnomalySensor(tracker)
         attrs = sensor.extra_state_attributes

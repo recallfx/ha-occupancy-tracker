@@ -51,7 +51,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     f"Sensor {entity_id} is unavailable or in unknown state, skipping event"
                 )
                 return
-            
+
             # Interpret HA state: 'on' becomes True; any other value is False
             sensor_state = new_state.state.lower() == "on"
             timestamp = time.time()

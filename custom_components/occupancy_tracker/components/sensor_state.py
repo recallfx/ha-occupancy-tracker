@@ -58,7 +58,7 @@ class SensorState:
 
     def record_adjacent_motion(self, area_id: str, timestamp: float) -> None:
         """Record motion in an adjacent area.
-        
+
         Args:
             area_id: The ID of the adjacent area with motion
             timestamp: The timestamp of the motion event

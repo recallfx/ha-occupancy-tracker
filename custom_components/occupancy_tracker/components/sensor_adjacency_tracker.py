@@ -41,7 +41,7 @@ class SensorAdjacencyTracker:
         """
         # Get adjacent sensor IDs
         adjacent_sensor_ids = self.adjacency_map.get(sensor_id, set())
-        
+
         # Convert adjacent sensor IDs to area IDs and check for recent motion
         for adj_sensor_id in adjacent_sensor_ids:
             area_id = self.sensor_to_area.get(adj_sensor_id)

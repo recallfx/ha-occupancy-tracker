@@ -85,7 +85,7 @@ class TestSensorAdjacencyTracker:
         tracker.set_sensor_area("sensor.motion_1", "hallway")
         tracker.set_sensor_area("sensor.motion_2", "living_room")
         tracker.set_sensor_area("sensor.motion_3", "kitchen")
-        
+
         # Set up adjacency: sensor1 is adjacent to sensor2 and sensor3
         tracker.set_adjacency("sensor.motion_1", {"sensor.motion_2", "sensor.motion_3"})
 
@@ -107,7 +107,7 @@ class TestSensorAdjacencyTracker:
         # Set up sensor-to-area mappings
         tracker.set_sensor_area("sensor.motion_1", "hallway")
         tracker.set_sensor_area("sensor.motion_2", "living_room")
-        
+
         # Set up adjacency
         tracker.set_adjacency("sensor.motion_1", {"sensor.motion_2"})
 
@@ -160,10 +160,11 @@ class TestSensorAdjacencyTracker:
         tracker.set_sensor_area("sensor.motion_living", "living_room")
         tracker.set_sensor_area("sensor.motion_kitchen", "kitchen")
         tracker.set_sensor_area("sensor.motion_bedroom", "bedroom")
-        
+
         # Set up adjacency with multiple sensors
         tracker.set_adjacency(
-            "sensor.motion_hallway", {"sensor.motion_living", "sensor.motion_kitchen", "sensor.motion_bedroom"}
+            "sensor.motion_hallway",
+            {"sensor.motion_living", "sensor.motion_kitchen", "sensor.motion_bedroom"},
         )
 
         # Record motion in kitchen only
@@ -224,10 +225,14 @@ class TestSensorAdjacencyTracker:
         tracker.set_sensor_area("sensor.dining", "dining_room")
         tracker.set_sensor_area("sensor.bedroom", "bedroom")
         tracker.set_sensor_area("sensor.bathroom", "bathroom")
-        
+
         # Set up multiple sensors with different adjacencies
-        tracker.set_adjacency("sensor.living_room", {"sensor.hallway", "sensor.kitchen_1"})
-        tracker.set_adjacency("sensor.kitchen_2", {"sensor.living_room", "sensor.dining"})
+        tracker.set_adjacency(
+            "sensor.living_room", {"sensor.hallway", "sensor.kitchen_1"}
+        )
+        tracker.set_adjacency(
+            "sensor.kitchen_2", {"sensor.living_room", "sensor.dining"}
+        )
         tracker.set_adjacency("sensor.bedroom", {"sensor.hallway", "sensor.bathroom"})
 
         # Record motion in various areas at different times

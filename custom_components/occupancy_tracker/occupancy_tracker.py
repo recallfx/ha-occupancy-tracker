@@ -192,7 +192,7 @@ class OccupancyTracker:
     def _handle_unexpected_motion(self, area: AreaState, timestamp: float) -> None:
         """Handle unexpected motion in an area that should be unoccupied."""
         # Delegate to anomaly detector to evaluate if this is a valid entry or anomaly
-        valid_entry = self.anomaly_detector.handle_unexpected_motion(
+        self.anomaly_detector.handle_unexpected_motion(
             area, self.areas, self.sensors, timestamp, self.adjacency_tracker
         )
 

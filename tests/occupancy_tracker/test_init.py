@@ -1,11 +1,11 @@
 """Tests for integration setup and initialization."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 import time
 
 from homeassistant.core import HomeAssistant, Event, State
-from homeassistant.const import STATE_ON, STATE_OFF
+from homeassistant.const import STATE_ON
 
 from custom_components.occupancy_tracker import (
     async_setup,
@@ -26,7 +26,10 @@ def sample_config():
                 "living_room": ["kitchen"],
             },
             "sensors": {
-                "binary_sensor.motion_living": {"area": "living_room", "type": "motion"},
+                "binary_sensor.motion_living": {
+                    "area": "living_room",
+                    "type": "motion",
+                },
                 "binary_sensor.motion_kitchen": {"area": "kitchen", "type": "motion"},
             },
         }
@@ -118,16 +121,14 @@ class TestStateChangeListener:
             "new_state": new_state,
         }
 
-        event = Event("state_changed", event_data)
+        Event("state_changed", event_data)
 
         # Manually trigger the listener
         # (In real HA, this would be triggered by async_track_state_change_event)
         timestamp_before = tracker.last_event_time
 
         # Simulate processing the event
-        tracker.process_sensor_event(
-            "binary_sensor.motion_living", True, time.time()
-        )
+        tracker.process_sensor_event("binary_sensor.motion_living", True, time.time())
 
         # Event should have been processed
         assert tracker.last_event_time > timestamp_before
@@ -141,14 +142,10 @@ class TestStateChangeListener:
         tracker = hass.data[DOMAIN]["occupancy_tracker"]
 
         # Set sensor to ON first
-        tracker.process_sensor_event(
-            "binary_sensor.motion_living", True, time.time()
-        )
+        tracker.process_sensor_event("binary_sensor.motion_living", True, time.time())
 
         # Then to OFF
-        tracker.process_sensor_event(
-            "binary_sensor.motion_living", False, time.time()
-        )
+        tracker.process_sensor_event("binary_sensor.motion_living", False, time.time())
 
         # Sensor state should be False
         assert tracker.sensors["binary_sensor.motion_living"].current_state is False
@@ -184,9 +181,7 @@ class TestIntegrationConfiguration:
         tracker = hass.data[DOMAIN]["occupancy_tracker"]
         assert len(tracker.areas) == 1
 
-    async def test_configuration_with_multiple_sensor_types(
-        self, hass: HomeAssistant
-    ):
+    async def test_configuration_with_multiple_sensor_types(self, hass: HomeAssistant):
         """Test configuration with different sensor types."""
         config = {
             DOMAIN: {
@@ -280,9 +275,7 @@ class TestIntegrationDataFlow:
 
         # Process motion event
         timestamp = time.time()
-        tracker.process_sensor_event(
-            "binary_sensor.motion_living", True, timestamp
-        )
+        tracker.process_sensor_event("binary_sensor.motion_living", True, timestamp)
 
         # Area should have motion recorded
         assert tracker.areas["living_room"].last_motion == timestamp
@@ -313,9 +306,7 @@ class TestIntegrationDataFlow:
         tracker = hass.data[DOMAIN]["occupancy_tracker"]
 
         # Simulate person entering (living room is not exit_capable, will create warning)
-        tracker.process_sensor_event(
-            "binary_sensor.motion_living", True, time.time()
-        )
+        tracker.process_sensor_event("binary_sensor.motion_living", True, time.time())
 
         # Should have occupancy (even if unexpected)
         assert tracker.get_occupancy("living_room") >= 1

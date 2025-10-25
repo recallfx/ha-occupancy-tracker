@@ -1,7 +1,6 @@
 """Tests for AnomalyDetector."""
 
 import time
-from unittest.mock import MagicMock
 
 from custom_components.occupancy_tracker.components.anomaly_detector import (
     AnomalyDetector,
@@ -58,9 +57,9 @@ class TestAnomalyDetector:
         detector = AnomalyDetector(config)
 
         # Create some warnings
-        w1 = detector._create_warning("type1", "Message 1")
+        detector._create_warning("type1", "Message 1")
         w2 = detector._create_warning("type2", "Message 2")
-        w3 = detector._create_warning("type3", "Message 3")
+        detector._create_warning("type3", "Message 3")
 
         # Resolve one
         w2.resolve()
@@ -76,7 +75,7 @@ class TestAnomalyDetector:
         detector = AnomalyDetector(config)
 
         w1 = detector._create_warning("type1", "Message 1")
-        w2 = detector._create_warning("type2", "Message 2")
+        detector._create_warning("type2", "Message 2")
 
         w1.resolve()
 
@@ -132,7 +131,7 @@ class TestAnomalyDetector:
                 timestamp - 100000,  # Very old - over 24 hours ago
             ),
         }
-        
+
         # Update kitchen sensor to "on" state so it can be detected as stuck
         sensors["sensor.motion_kitchen"].update_state(True, timestamp - 100000)
 
@@ -211,7 +210,7 @@ class TestAnomalyDetector:
         adjacency_tracker = SensorAdjacencyTracker()
 
         # Entry from outside in exit-capable area is valid
-        result = detector.handle_unexpected_motion(
+        detector.handle_unexpected_motion(
             areas["front_porch"], areas, sensors, timestamp, adjacency_tracker
         )
 
@@ -239,7 +238,7 @@ class TestAnomalyDetector:
         adjacency_tracker = SensorAdjacencyTracker()
 
         # Bedroom has unexpected motion with no adjacent occupied areas
-        result = detector.handle_unexpected_motion(
+        detector.handle_unexpected_motion(
             areas["bedroom"], areas, sensors, timestamp, adjacency_tracker
         )
 

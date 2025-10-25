@@ -1,6 +1,5 @@
 """Tests for component models (AreaState, SensorState, Warning, SensorHistoryItem)."""
 
-import pytest
 import time
 
 from custom_components.occupancy_tracker.components.area_state import AreaState
