@@ -73,13 +73,15 @@ class OccupancyTracker:
 
         sensor = self.sensors[sensor_id]
         sensor_type = sensor.config.get("type", "")
-        
+
         # Add debug logging for motion sensors
         if sensor_type in ["motion", "camera_motion", "camera_person"]:
-            logger.debug(f"Motion sensor event: {sensor_id}, state={state}, type={sensor_type}")
-        
+            logger.debug(
+                f"Motion sensor event: {sensor_id}, state={state}, type={sensor_type}"
+            )
+
         state_changed = sensor.update_state(state, timestamp)
-        
+
         # Add more debug logging about the state change result
         if sensor_type in ["motion", "camera_motion", "camera_person"]:
             logger.debug(f"Motion sensor {sensor_id} state_changed={state_changed}")
@@ -323,45 +325,52 @@ class OccupancyTracker:
 
     def diagnose_motion_issues(self, sensor_id: str = None) -> Dict[str, Any]:
         """Diagnostic method to help identify why motion isn't being detected.
-        
+
         Args:
             sensor_id: Optional specific sensor to diagnose
-            
+
         Returns:
             Dict with diagnostic information
         """
         sensors_to_check = [sensor_id] if sensor_id else list(self.sensors.keys())
         results = {}
-        
+
         for s_id in sensors_to_check:
             if s_id not in self.sensors:
                 results[s_id] = {"error": "Sensor not found"}
                 continue
-                
+
             sensor = self.sensors[s_id]
             sensor_type = sensor.config.get("type", "unknown")
             area_id = sensor.config.get("area")
-            
+
             sensor_info = {
                 "sensor_type": sensor_type,
-                "is_motion_sensor": sensor_type in ["motion", "camera_motion", "camera_person"],
+                "is_motion_sensor": sensor_type
+                in ["motion", "camera_motion", "camera_person"],
                 "current_state": sensor.current_state,
                 "area_id": area_id,
                 "area_exists": area_id in self.areas if area_id else False,
-                "history_length": len(sensor.history) if hasattr(sensor, "history") else "unknown",
-                "is_reliable": sensor.is_reliable if hasattr(sensor, "is_reliable") else "unknown",
+                "history_length": len(sensor.history)
+                if hasattr(sensor, "history")
+                else "unknown",
+                "is_reliable": sensor.is_reliable
+                if hasattr(sensor, "is_reliable")
+                else "unknown",
             }
-            
+
             # Add area information if applicable
             if area_id and area_id in self.areas:
                 area = self.areas[area_id]
                 sensor_info["area_info"] = {
                     "occupancy": area.occupancy,
                     "last_motion": area.last_motion,
-                    "time_since_motion": time.time() - area.last_motion if area.last_motion > 0 else None,
-                    "activity_history_length": len(area.activity_history)
+                    "time_since_motion": time.time() - area.last_motion
+                    if area.last_motion > 0
+                    else None,
+                    "activity_history_length": len(area.activity_history),
                 }
-            
+
             results[s_id] = sensor_info
-            
+
         return results
