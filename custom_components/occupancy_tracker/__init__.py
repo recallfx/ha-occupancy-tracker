@@ -3,7 +3,10 @@
 import logging
 import time
 
+import voluptuous as vol
+
 from homeassistant.core import Event, HomeAssistant
+import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event
@@ -13,6 +16,36 @@ from .occupancy_tracker import OccupancyTracker
 
 _LOGGER = logging.getLogger(__name__)
 DOMAIN = "occupancy_tracker"
+
+# Schema for individual sensor configuration
+SENSOR_SCHEMA = vol.Schema(
+    {
+        vol.Required("area"): vol.Any(cv.string, [cv.string]),
+        vol.Optional("type", default="motion"): cv.string,
+    }
+)
+
+# Schema for individual area configuration
+AREA_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): cv.string,
+        vol.Optional("exit_capable", default=False): cv.boolean,
+    }
+)
+
+# Main configuration schema
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Schema(
+            {
+                vol.Required("areas"): vol.Schema({cv.string: AREA_SCHEMA}),
+                vol.Required("adjacency"): vol.Schema({cv.string: [cv.string]}),
+                vol.Required("sensors"): vol.Schema({cv.entity_id: SENSOR_SCHEMA}),
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
