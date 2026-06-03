@@ -11,6 +11,7 @@ class SensorState:
         self.config = sensor_config
         # Pre-compute normalized area IDs (config never changes after init)
         from .constants import normalize_area_ids
+
         self.area_ids: list[str] = normalize_area_ids(sensor_config.get("area"))
         self.current_state = False
         self.last_changed = 0  # Only set by real state changes, not init

@@ -50,9 +50,7 @@ class AreaState:
         """
         return _ClaimsProxy(self)
 
-    def record_entry(
-        self, timestamp: float, claim_id: str | None = None
-    ) -> None:
+    def record_entry(self, timestamp: float, claim_id: str | None = None) -> None:
         """Backward-compatible: mark area as occupied."""
         self._occupied = True
         self.activity_history.append((timestamp, "entry"))
