@@ -24,7 +24,12 @@ _LOGGER = logging.getLogger("occupancy_tracker")
 _RAW_LOGGER = logging.getLogger("occupancy_tracker.raw")
 
 # All loggers used by this integration
-_INTEGRATION_LOGGERS = ["occupancy_tracker", "resolver", "coordinator", "anomaly_detector"]
+_INTEGRATION_LOGGERS = [
+    "occupancy_tracker",
+    "resolver",
+    "coordinator",
+    "anomaly_detector",
+]
 
 
 def _setup_file_logging(config_dir: str) -> None:
@@ -51,6 +56,7 @@ def _setup_file_logging(config_dir: str) -> None:
     raw_logger.addHandler(raw_handler)
     raw_logger.setLevel(logging.DEBUG)
     raw_logger.propagate = False
+
 
 # Schema for individual sensor configuration
 def _export_sensor_history(config_dir: str, config: dict) -> None:

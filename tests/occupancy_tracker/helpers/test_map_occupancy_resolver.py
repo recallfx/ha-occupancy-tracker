@@ -44,6 +44,7 @@ def _set_occupancy(area, count):
 # Transfer-on-ON: basic claim transfer tests
 # ============================================================
 
+
 def test_transfer_on_on_basic():
     """Motion-ON in destination pulls claim from occupied adjacent source."""
     now = time.time()
@@ -151,6 +152,7 @@ def test_motion_off_noop_after_transfer():
 # Exit-capable areas
 # ============================================================
 
+
 def test_exit_capable_new_entry():
     """Exit-capable area creates new claim when no adjacent source."""
     now = time.time()
@@ -234,6 +236,7 @@ def test_exit_capable_does_not_clear_if_indoor_neighbor_active():
 # Phantom rejection
 # ============================================================
 
+
 def test_phantom_rejection_no_source():
     """Indoor non-exit area with no plausible source rejects motion."""
     now = time.time()
@@ -246,9 +249,7 @@ def test_phantom_rejection_no_source():
     detector = AnomalyDetector(config)
 
     areas = {"isolated": AreaState("isolated", config["areas"]["isolated"])}
-    sensors = {
-        "s.i": SensorState("s.i", {"area": "isolated", "type": "motion"}, now)
-    }
+    sensors = {"s.i": SensorState("s.i", {"area": "isolated", "type": "motion"}, now)}
 
     _fire(resolver, sensors, areas, "s.i", True, now, detector)
     assert areas["isolated"].occupancy == 0
@@ -322,6 +323,7 @@ def test_phantom_not_rejected_with_magnetic_evidence():
 # Already occupied: no-op
 # ============================================================
 
+
 def test_motion_on_already_occupied_is_noop():
     """Motion-ON in area that already has claims does nothing."""
     now = time.time()
@@ -348,6 +350,7 @@ def test_motion_on_already_occupied_is_noop():
 # ============================================================
 # Person stays (motion-OFF with no exit)
 # ============================================================
+
 
 def test_person_stays_non_exit_off():
     """Person stays when motion-OFF fires in a non-exit area with no active neighbor."""
@@ -385,6 +388,7 @@ def test_person_stays_non_exit_off():
 # ============================================================
 # Convergence: two people end up in same room
 # ============================================================
+
 
 def test_convergence_sole_active_neighbor():
     """Motion-OFF with sole active neighbor transfers claim (convergence rule)."""
@@ -437,6 +441,7 @@ def test_convergence_sole_active_neighbor():
 # Outdoor -> Indoor transfer
 # ============================================================
 
+
 def test_outdoor_to_indoor_transfer():
     """Claim transfers from outdoor to indoor on motion-ON."""
     now = time.time()
@@ -473,6 +478,7 @@ def test_outdoor_to_indoor_transfer():
 # Multi-sensor same room
 # ============================================================
 
+
 def test_multi_sensor_same_room():
     """Multiple sensors in same room: OFF only triggers when ALL sensors are off."""
     now = time.time()
@@ -507,6 +513,7 @@ def test_multi_sensor_same_room():
 # ============================================================
 # Open-plan group handling
 # ============================================================
+
 
 def test_open_plan_rebalance():
     """Open-plan group: motion in different member rebalances, doesn't inflate."""
@@ -615,6 +622,7 @@ def test_open_plan_exit_to_non_group_area():
 # Intrusion with outdoor evidence
 # ============================================================
 
+
 def test_outdoor_evidence_allows_entry():
     """Outdoor activity + motion in adjacent indoor area creates a claim."""
     now = time.time()
@@ -651,6 +659,7 @@ def test_outdoor_evidence_allows_entry():
 # ============================================================
 # Recalculate from history
 # ============================================================
+
 
 def test_recalculate_from_history():
     """Recalculate produces same state when replayed."""
@@ -706,6 +715,7 @@ def test_recalculate_from_history():
 # Two people in different rooms (separate claims)
 # ============================================================
 
+
 def test_two_people_separate_rooms():
     """Two people entering at different exit-capable areas get separate claims."""
     now = time.time()
@@ -744,6 +754,7 @@ def test_two_people_separate_rooms():
 # Adjacency building
 # ============================================================
 
+
 def test_adjacency_bidirectional():
     """Adjacency map is built bidirectionally."""
     config = {
@@ -777,6 +788,7 @@ def test_open_plan_groups_parsed():
 # Magnetic events
 # ============================================================
 
+
 def test_magnetic_event_updates_last_motion():
     """Magnetic events update last_motion on linked areas."""
     now = time.time()
@@ -806,6 +818,7 @@ def test_magnetic_event_updates_last_motion():
 # ============================================================
 # Full walkthrough scenario
 # ============================================================
+
 
 def test_full_walkthrough_entry_traverse_exit():
     """Person enters, walks through house, and leaves."""

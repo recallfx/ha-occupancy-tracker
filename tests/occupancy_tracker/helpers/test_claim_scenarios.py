@@ -22,6 +22,7 @@ from custom_components.occupancy_tracker.helpers.map_state_recorder import MapSn
 # Helpers (same pattern as test_map_occupancy_resolver.py)
 # ------------------------------------------------------------------
 
+
 def _sensor_event(sensor_id: str, on: bool, ts: float) -> MapSnapshot:
     return MapSnapshot(
         timestamp=ts,
@@ -51,6 +52,7 @@ def _total_occupancy(areas):
 # House layout config builder for open-plan scenarios
 # ------------------------------------------------------------------
 
+
 def _open_plan_config():
     """Config matching the user's open-plan kitchen/dining/living layout."""
     return {
@@ -75,9 +77,15 @@ def _open_plan_config():
 def _open_plan_areas_and_sensors(config, now):
     areas = {aid: AreaState(aid, cfg) for aid, cfg in config["areas"].items()}
     sensors = {
-        "s.entrance": SensorState("s.entrance", {"area": "entrance", "type": "motion"}, now),
-        "s.kitchen": SensorState("s.kitchen", {"area": "kitchen", "type": "motion"}, now),
-        "s.dining": SensorState("s.dining", {"area": "dining_room", "type": "motion"}, now),
+        "s.entrance": SensorState(
+            "s.entrance", {"area": "entrance", "type": "motion"}, now
+        ),
+        "s.kitchen": SensorState(
+            "s.kitchen", {"area": "kitchen", "type": "motion"}, now
+        ),
+        "s.dining": SensorState(
+            "s.dining", {"area": "dining_room", "type": "motion"}, now
+        ),
         "s.living": SensorState("s.living", {"area": "living", "type": "motion"}, now),
     }
     return areas, sensors
@@ -86,6 +94,7 @@ def _open_plan_areas_and_sensors(config, now):
 # ------------------------------------------------------------------
 # Full house config for walk-chain tests
 # ------------------------------------------------------------------
+
 
 def _full_house_config():
     """Config matching the user's full house layout."""
@@ -121,16 +130,34 @@ def _full_house_config():
 def _full_house_areas_and_sensors(config, now):
     areas = {aid: AreaState(aid, cfg) for aid, cfg in config["areas"].items()}
     sensors = {
-        "s.frontyard": SensorState("s.frontyard", {"area": "frontyard", "type": "camera_person"}, now),
-        "s.entrance": SensorState("s.entrance", {"area": "entrance", "type": "motion"}, now),
-        "s.corridor_1": SensorState("s.corridor_1", {"area": "corridor_1", "type": "motion"}, now),
+        "s.frontyard": SensorState(
+            "s.frontyard", {"area": "frontyard", "type": "camera_person"}, now
+        ),
+        "s.entrance": SensorState(
+            "s.entrance", {"area": "entrance", "type": "motion"}, now
+        ),
+        "s.corridor_1": SensorState(
+            "s.corridor_1", {"area": "corridor_1", "type": "motion"}, now
+        ),
         "s.study": SensorState("s.study", {"area": "study", "type": "motion"}, now),
-        "s.bedroom_2": SensorState("s.bedroom_2", {"area": "bedroom_2", "type": "motion"}, now),
-        "s.bathroom": SensorState("s.bathroom", {"area": "bathroom", "type": "motion"}, now),
-        "s.corridor_2": SensorState("s.corridor_2", {"area": "corridor_2", "type": "motion"}, now),
-        "s.bedroom_1": SensorState("s.bedroom_1", {"area": "bedroom_1", "type": "motion"}, now),
-        "s.kitchen": SensorState("s.kitchen", {"area": "kitchen", "type": "motion"}, now),
-        "s.dining": SensorState("s.dining", {"area": "dining_room", "type": "motion"}, now),
+        "s.bedroom_2": SensorState(
+            "s.bedroom_2", {"area": "bedroom_2", "type": "motion"}, now
+        ),
+        "s.bathroom": SensorState(
+            "s.bathroom", {"area": "bathroom", "type": "motion"}, now
+        ),
+        "s.corridor_2": SensorState(
+            "s.corridor_2", {"area": "corridor_2", "type": "motion"}, now
+        ),
+        "s.bedroom_1": SensorState(
+            "s.bedroom_1", {"area": "bedroom_1", "type": "motion"}, now
+        ),
+        "s.kitchen": SensorState(
+            "s.kitchen", {"area": "kitchen", "type": "motion"}, now
+        ),
+        "s.dining": SensorState(
+            "s.dining", {"area": "dining_room", "type": "motion"}, now
+        ),
         "s.living": SensorState("s.living", {"area": "living", "type": "motion"}, now),
     }
     return areas, sensors
@@ -141,6 +168,7 @@ def _full_house_areas_and_sensors(config, now):
 #    From log: 18:12:46 kitchen ON, 18:12:47 dining ON
 #    Must result in exactly 1 occupant, not 2.
 # ==================================================================
+
 
 def test_open_plan_simultaneous_fire():
     """Kitchen and dining fire 0.8s apart -- overlap, not two people."""
@@ -198,6 +226,7 @@ def test_open_plan_triple_fire():
 #    Person walks from corridor to study. Must transfer, not 2 occupants.
 # ==================================================================
 
+
 def test_corridor_study_overlap():
     """Corridor_1 and study fire 1.0s apart (sensor overlap/spill)."""
     now = time.time()
@@ -228,6 +257,7 @@ def test_corridor_study_overlap():
 #    From log 18:12 movement chain with real timing gaps.
 #    1 person throughout, ending in last room.
 # ==================================================================
+
 
 def test_full_walk_chain():
     """Simulate study -> corridor_1 -> entrance -> kitchen -> dining.
@@ -299,6 +329,7 @@ def test_full_walk_chain():
 #    Occupancy must stay at 1 the entire time.
 # ==================================================================
 
+
 def test_person_sitting_sensor_cycling():
     """Person in study, sensor cycles ON/OFF repeatedly. Occupancy stays 1."""
     now = time.time()
@@ -337,6 +368,7 @@ def test_person_sitting_sensor_cycling():
 #    Each room stays at 1, no cross-contamination.
 # ==================================================================
 
+
 def test_two_people_different_rooms():
     """Person A in study, person B in bedroom_1. Both cycling. No cross-contamination."""
     now = time.time()
@@ -358,11 +390,19 @@ def test_two_people_different_rooms():
     resolver = MapOccupancyResolver(config)
     areas = {aid: AreaState(aid, cfg) for aid, cfg in config["areas"].items()}
     sensors = {
-        "s.entrance": SensorState("s.entrance", {"area": "entrance", "type": "motion"}, now),
-        "s.corridor_1": SensorState("s.corridor_1", {"area": "corridor_1", "type": "motion"}, now),
+        "s.entrance": SensorState(
+            "s.entrance", {"area": "entrance", "type": "motion"}, now
+        ),
+        "s.corridor_1": SensorState(
+            "s.corridor_1", {"area": "corridor_1", "type": "motion"}, now
+        ),
         "s.study": SensorState("s.study", {"area": "study", "type": "motion"}, now),
-        "s.corridor_2": SensorState("s.corridor_2", {"area": "corridor_2", "type": "motion"}, now),
-        "s.bedroom_1": SensorState("s.bedroom_1", {"area": "bedroom_1", "type": "motion"}, now),
+        "s.corridor_2": SensorState(
+            "s.corridor_2", {"area": "corridor_2", "type": "motion"}, now
+        ),
+        "s.bedroom_1": SensorState(
+            "s.bedroom_1", {"area": "bedroom_1", "type": "motion"}, now
+        ),
     }
 
     # Person A enters and goes to study
@@ -399,14 +439,18 @@ def test_two_people_different_rooms():
         _fire(resolver, sensors, areas, "s.study", False, t)
         _fire(resolver, sensors, areas, "s.bedroom_1", False, t + 0.5)
         assert areas["study"].occupancy == 1, f"Study lost occupancy at cycle {cycle}"
-        assert areas["bedroom_1"].occupancy == 1, f"Bedroom lost occupancy at cycle {cycle}"
+        assert areas["bedroom_1"].occupancy == 1, (
+            f"Bedroom lost occupancy at cycle {cycle}"
+        )
         t += 3.0
 
         # Both ON
         _fire(resolver, sensors, areas, "s.study", True, t)
         _fire(resolver, sensors, areas, "s.bedroom_1", True, t + 0.3)
         assert areas["study"].occupancy == 1, f"Study wrong on ON at cycle {cycle}"
-        assert areas["bedroom_1"].occupancy == 1, f"Bedroom wrong on ON at cycle {cycle}"
+        assert areas["bedroom_1"].occupancy == 1, (
+            f"Bedroom wrong on ON at cycle {cycle}"
+        )
         t += 5.0
 
     assert _total_occupancy(areas) == 2
@@ -417,6 +461,7 @@ def test_two_people_different_rooms():
 #    caused K@6 in production. Kitchen and dining sensors alternating
 #    ON/OFF as person moves around kitchen. After 10 cycles, must be 1.
 # ==================================================================
+
 
 def test_open_plan_kitchen_dining_oscillation():
     """Kitchen and dining sensors alternate ON/OFF -- the inflation pattern.
@@ -485,6 +530,7 @@ def test_open_plan_kitchen_dining_oscillation():
 #    entrance_motion fires. Exactly 1 claim created.
 # ==================================================================
 
+
 def test_person_enters_from_outside():
     """Camera detects person in frontyard, then entrance motion fires.
 
@@ -529,6 +575,7 @@ def test_person_enters_from_outside():
 #    C2 fix: first activation seeds the system when total claims == 0.
 # ==================================================================
 
+
 def test_bootstrap_after_restart():
     """After HA restart (all claims empty), first sensor in non-exit area is accepted."""
     now = time.time()
@@ -557,9 +604,7 @@ def test_bootstrap_does_not_apply_to_isolated_area():
     detector = AnomalyDetector(config)
 
     areas = {"isolated": AreaState("isolated", config["areas"]["isolated"])}
-    sensors = {
-        "s.i": SensorState("s.i", {"area": "isolated", "type": "motion"}, now)
-    }
+    sensors = {"s.i": SensorState("s.i", {"area": "isolated", "type": "motion"}, now)}
 
     _fire(resolver, sensors, areas, "s.i", True, now, detector)
     assert areas["isolated"].occupancy == 0
@@ -575,6 +620,7 @@ def test_bootstrap_does_not_apply_to_isolated_area():
 #     overlap) and pulls the claim BACK, trapping it in a dead-end.
 #     The reverse-transfer guard must prevent this.
 # ==================================================================
+
 
 def test_doorway_overlap_does_not_reverse_claim():
     """Person walks bedroom_1 -> corridor_2 -> corridor_1 -> kitchen.
@@ -670,7 +716,9 @@ def test_reverse_guard_does_not_block_legitimate_return():
     # Corridor_2 may still be retained briefly (conservative — better than
     # dropping a real person). Trigger cleanup after inactivity timeout.
     _fire(resolver, sensors, areas, "s.bedroom_1", False, t + 15.0)
-    _fire(resolver, sensors, areas, "s.bedroom_1", True, t + 135.0)  # 127s after corridor_2 last_motion (>120s)
+    _fire(
+        resolver, sensors, areas, "s.bedroom_1", True, t + 135.0
+    )  # 127s after corridor_2 last_motion (>120s)
     assert areas["bedroom_1"].occupancy == 1
     assert _total_occupancy(areas) == 1
 
@@ -678,6 +726,7 @@ def test_reverse_guard_does_not_block_legitimate_return():
 # ==================================================================
 # 11. Bootstrap registers multiple people after restart
 # ==================================================================
+
 
 def test_bootstrap_registers_multiple_people():
     """After restart, all max_occupants people register within BOOTSTRAP_WINDOW."""
@@ -707,6 +756,7 @@ def test_bootstrap_registers_multiple_people():
 # 12. Bootstrap expires after BOOTSTRAP_WINDOW
 # ==================================================================
 
+
 def test_bootstrap_expires_after_window():
     """Bootstrap does not accept new activations after BOOTSTRAP_WINDOW."""
     now = time.time()
@@ -732,6 +782,7 @@ def test_bootstrap_expires_after_window():
 # ==================================================================
 # 13. Retained room clears after RETAINED_INACTIVITY_TIMEOUT
 # ==================================================================
+
 
 def test_retained_room_clears_after_inactivity():
     """Non-transition room clears after RETAINED_INACTIVITY_TIMEOUT (60s)."""
@@ -766,6 +817,7 @@ def test_retained_room_clears_after_inactivity():
 # 14. Sitting person NOT cleared by inactivity timeout
 # ==================================================================
 
+
 def test_sitting_person_not_cleared_by_inactivity():
     """Person sitting with sensor cycling every 10s is never cleared."""
     now = time.time()
@@ -785,12 +837,13 @@ def test_sitting_person_not_cleared_by_inactivity():
         _fire(resolver, sensors, areas, "s.study", False, t + 5)
         _fire(resolver, sensors, areas, "s.study", True, t + 10)
         t += 10
-        assert areas["study"].occupancy == 1, f"Study lost occupancy at cycle {i+1}"
+        assert areas["study"].occupancy == 1, f"Study lost occupancy at cycle {i + 1}"
 
 
 # ==================================================================
 # 15. Persistent activation at 2 triggers (reduced from 3)
 # ==================================================================
+
 
 def test_persistent_activation_at_two_triggers():
     """Room accepted after 2 activations in 5 minutes."""
@@ -820,6 +873,7 @@ def test_persistent_activation_at_two_triggers():
 # 16. Sensor-ON blocks displacement — housemate walks corridor,
 #     person in study with active sensor is NOT displaced.
 # ==================================================================
+
 
 def test_sensor_on_blocks_displacement():
     """Person in study (sensor cycling) is not displaced when housemate walks corridor.
@@ -874,6 +928,7 @@ def test_sensor_on_blocks_displacement():
 # 17. Sleeping person not cleared — no adjacent motion evidence.
 # ==================================================================
 
+
 def test_sleeping_person_not_cleared():
     """Person in bedroom with no motion for 2+ min is NOT cleared if no
     adjacent room has more recent motion (no evidence of leaving)."""
@@ -910,6 +965,7 @@ def test_sleeping_person_not_cleared():
 # ==================================================================
 # 18. Sensor OFF gap (5s KNX cycle) does NOT drop occupancy.
 # ==================================================================
+
 
 def test_sensor_off_gap_keeps_occupancy():
     """During the 5s sensor OFF gap, room stays occupied via retention."""
@@ -950,6 +1006,7 @@ def test_sensor_off_gap_keeps_occupancy():
 # 19. Sleeping person wakes up — walk chain is immediate.
 # ==================================================================
 
+
 def test_sleeping_person_wakes_walk_is_immediate():
     """Person sleeps in bedroom_1 for 5 min, wakes up, walks to bathroom.
     Every room in the chain must be immediately occupied."""
@@ -976,7 +1033,9 @@ def test_sleeping_person_wakes_walk_is_immediate():
 
     # Person wakes up — bedroom_1 sensor fires
     _fire(resolver, sensors, areas, "s.bedroom_1", True, t)
-    assert areas["bedroom_1"].occupancy == 1, "Bedroom not immediately occupied on wake!"
+    assert areas["bedroom_1"].occupancy == 1, (
+        "Bedroom not immediately occupied on wake!"
+    )
 
     # Walk: bedroom_1 → corridor_2 → corridor_1 → bathroom
     _fire(resolver, sensors, areas, "s.corridor_2", True, t + 3)
@@ -994,6 +1053,7 @@ def test_sleeping_person_wakes_walk_is_immediate():
 #     Person in study, sensor in 5s OFF gap, housemate walks corridor.
 #     Study must NOT lose occupancy.
 # ==================================================================
+
 
 def test_sensor_off_gap_blocks_displacement():
     """Person in study during 5s sensor OFF gap. Housemate walks corridor.
@@ -1043,6 +1103,7 @@ def test_sensor_off_gap_blocks_displacement():
 # 21. Retention cooldown — recently retained room immune to displacement
 # ==================================================================
 
+
 def test_retention_cooldown_blocks_displacement():
     """Room retained < 30s ago cannot be displaced even if guards are met."""
     now = time.time()
@@ -1079,6 +1140,7 @@ def test_retention_cooldown_blocks_displacement():
 #     (120s) hasn't elapsed yet — and there's no leaving evidence
 #     unless someone walks through a DIRECT neighbor.
 # ==================================================================
+
 
 def test_still_person_sensor_stops_housemate_enters():
     """Person reads in study (sensor stopped). Housemate enters from outside
@@ -1130,6 +1192,7 @@ def test_still_person_sensor_stops_housemate_enters():
 #     Room must recover immediately when sensor re-fires.
 # ==================================================================
 
+
 def test_still_person_recovers_on_sensor_refire():
     """If displacement happens after guards expire (single-person,
     no entry evidence), the room recovers immediately when the
@@ -1154,16 +1217,16 @@ def test_still_person_recovers_on_sensor_refire():
     _fire(resolver, sensors, areas, "s.corridor_1", True, now + 45)
 
     # With no exit-capable evidence, study is displaced (expected)
-    assert areas["study"].occupancy == 0, "Study should be displaced (no entry evidence)"
+    assert areas["study"].occupancy == 0, (
+        "Study should be displaced (no entry evidence)"
+    )
     assert areas["corridor_1"].occupancy == 1
 
     # Corridor sensor goes OFF, then person shifts — study sensor re-fires.
     # Study must recover immediately (corridor_1 is adjacent + occupied).
     _fire(resolver, sensors, areas, "s.corridor_1", False, now + 50)
     _fire(resolver, sensors, areas, "s.study", True, now + 55)
-    assert areas["study"].occupancy == 1, (
-        "Study did not recover after sensor re-fired!"
-    )
+    assert areas["study"].occupancy == 1, "Study did not recover after sensor re-fired!"
 
 
 # ==================================================================
@@ -1172,6 +1235,7 @@ def test_still_person_recovers_on_sensor_refire():
 #     persistent activation (2 cycles). The "recently occupied"
 #     check accepts it on the first activation.
 # ==================================================================
+
 
 def test_recently_occupied_room_reactivates_immediately():
     """Room displaced, then sensor fires again. Must be immediately

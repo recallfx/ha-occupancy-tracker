@@ -15,7 +15,25 @@ def _set_occ(area, n):
 
 @pytest.fixture
 def linear_config():
-    return {DOMAIN: {"areas": {"area_a": {"name": "A", "exit_capable": True}, "area_b": {"name": "B"}, "area_c": {"name": "C"}}, "adjacency": {"area_a": ["area_b"], "area_b": ["area_a", "area_c"], "area_c": ["area_b"]}, "sensors": {"binary_sensor.motion_a": {"area": "area_a", "type": "motion"}, "binary_sensor.motion_b": {"area": "area_b", "type": "motion"}, "binary_sensor.motion_c": {"area": "area_c", "type": "motion"}}}}
+    return {
+        DOMAIN: {
+            "areas": {
+                "area_a": {"name": "A", "exit_capable": True},
+                "area_b": {"name": "B"},
+                "area_c": {"name": "C"},
+            },
+            "adjacency": {
+                "area_a": ["area_b"],
+                "area_b": ["area_a", "area_c"],
+                "area_c": ["area_b"],
+            },
+            "sensors": {
+                "binary_sensor.motion_a": {"area": "area_a", "type": "motion"},
+                "binary_sensor.motion_b": {"area": "area_b", "type": "motion"},
+                "binary_sensor.motion_c": {"area": "area_c", "type": "motion"},
+            },
+        }
+    }
 
 
 @pytest.fixture
@@ -26,14 +44,16 @@ async def linear(hass: HomeAssistant, linear_config):
 
 class TestSingleOccupant:
     async def test_appearance_and_exit(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         assert c.get_occupancy("area_a") == 1
         h.trigger_sensor("binary_sensor.motion_a", False)
         assert c.get_occupancy("area_a") == 0
 
     async def test_simple_movement(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         assert c.get_occupancy("area_a") == 1
         h.trigger_sensor("binary_sensor.motion_b", True, delay=0.5)
@@ -41,7 +61,8 @@ class TestSingleOccupant:
         assert c.get_occupancy("area_b") == 1
 
     async def test_chain_movement(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=0.5)
         h.trigger_sensor("binary_sensor.motion_a", False, delay=0.5)
@@ -53,7 +74,8 @@ class TestSingleOccupant:
         assert c.get_occupancy("area_c") == 1
 
     async def test_person_stays(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_c", True, delay=1)
@@ -70,7 +92,8 @@ class TestSingleOccupant:
 
 class TestMultiOccupant:
     async def test_two_people_sequential(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_c", True, delay=1)
@@ -82,7 +105,8 @@ class TestMultiOccupant:
         assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c"]) == 2
 
     async def test_two_people_different_rooms(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_c", True, delay=1)
@@ -99,14 +123,16 @@ class TestMultiOccupant:
 
 class TestEdgeCases:
     async def test_rapid_movement(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=0.5)
         assert c.get_occupancy("area_a") == 0
         assert c.get_occupancy("area_b") == 1
 
     async def test_exit_reenter(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_a", False, delay=5)
         assert c.get_occupancy("area_a") == 0
@@ -120,7 +146,8 @@ class TestEdgeCases:
         BOOTSTRAP_WINDOW (120s). To test phantom rejection, the phantom
         must fire AFTER bootstrap expires.
         """
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         # Person enters and stays in A
         h.trigger_sensor("binary_sensor.motion_a", True)
         assert c.get_occupancy("area_a") == 1
@@ -137,10 +164,25 @@ class TestEdgeCases:
         assert c.get_occupancy("area_a") == 1
 
 
-
 @pytest.fixture
 def hub_config():
-    return {DOMAIN: {"areas": {"hall": {"name": "Hall", "exit_capable": True}, "kitchen": {"name": "Kitchen"}, "bedroom": {"name": "Bedroom"}, "bathroom": {"name": "Bathroom"}}, "adjacency": {"hall": ["kitchen", "bedroom", "bathroom"]}, "sensors": {"binary_sensor.motion_hall": {"area": "hall", "type": "motion"}, "binary_sensor.motion_kitchen": {"area": "kitchen", "type": "motion"}, "binary_sensor.motion_bedroom": {"area": "bedroom", "type": "motion"}, "binary_sensor.motion_bathroom": {"area": "bathroom", "type": "motion"}}}}
+    return {
+        DOMAIN: {
+            "areas": {
+                "hall": {"name": "Hall", "exit_capable": True},
+                "kitchen": {"name": "Kitchen"},
+                "bedroom": {"name": "Bedroom"},
+                "bathroom": {"name": "Bathroom"},
+            },
+            "adjacency": {"hall": ["kitchen", "bedroom", "bathroom"]},
+            "sensors": {
+                "binary_sensor.motion_hall": {"area": "hall", "type": "motion"},
+                "binary_sensor.motion_kitchen": {"area": "kitchen", "type": "motion"},
+                "binary_sensor.motion_bedroom": {"area": "bedroom", "type": "motion"},
+                "binary_sensor.motion_bathroom": {"area": "bathroom", "type": "motion"},
+            },
+        }
+    }
 
 
 @pytest.fixture
@@ -151,14 +193,16 @@ async def hub(hass: HomeAssistant, hub_config):
 
 class TestHub:
     async def test_entry_to_room(self, hub: HomeAssistant):
-        c = hub.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = hub.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_hall", True)
         h.trigger_sensor("binary_sensor.motion_kitchen", True, delay=1)
         assert c.get_occupancy("hall") == 0
         assert c.get_occupancy("kitchen") == 1
 
     async def test_bedroom_to_kitchen(self, hub: HomeAssistant):
-        c = hub.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = hub.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_hall", True)
         h.trigger_sensor("binary_sensor.motion_bedroom", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_hall", False, delay=3)
@@ -179,7 +223,8 @@ class TestHub:
         but in hub config all rooms are adjacent to hall.
         So we test that the single claim propagates correctly.
         """
-        c = hub.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = hub.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         # P1: hall -> kitchen
         h.trigger_sensor("binary_sensor.motion_hall", True)
         h.trigger_sensor("binary_sensor.motion_kitchen", True, delay=1)
@@ -195,12 +240,35 @@ class TestHub:
         assert c.get_occupancy("bedroom") == 1
         assert c.get_occupancy("hall") == 0
         # Total occupancy is 1 (limitation: can't create second claim through hub)
-        assert sum(c.get_occupancy(a) for a in ["hall", "kitchen", "bedroom", "bathroom"]) == 1
+        assert (
+            sum(c.get_occupancy(a) for a in ["hall", "kitchen", "bedroom", "bathroom"])
+            == 1
+        )
 
 
 @pytest.fixture
 def loop_config():
-    return {DOMAIN: {"areas": {"area_a": {"name": "A", "exit_capable": True}, "area_b": {"name": "B"}, "area_c": {"name": "C"}, "area_d": {"name": "D"}}, "adjacency": {"area_a": ["area_b", "area_d"], "area_b": ["area_c"], "area_c": ["area_d"]}, "sensors": {"binary_sensor.motion_a": {"area": "area_a", "type": "motion"}, "binary_sensor.motion_b": {"area": "area_b", "type": "motion"}, "binary_sensor.motion_c": {"area": "area_c", "type": "motion"}, "binary_sensor.motion_d": {"area": "area_d", "type": "motion"}}}}
+    return {
+        DOMAIN: {
+            "areas": {
+                "area_a": {"name": "A", "exit_capable": True},
+                "area_b": {"name": "B"},
+                "area_c": {"name": "C"},
+                "area_d": {"name": "D"},
+            },
+            "adjacency": {
+                "area_a": ["area_b", "area_d"],
+                "area_b": ["area_c"],
+                "area_c": ["area_d"],
+            },
+            "sensors": {
+                "binary_sensor.motion_a": {"area": "area_a", "type": "motion"},
+                "binary_sensor.motion_b": {"area": "area_b", "type": "motion"},
+                "binary_sensor.motion_c": {"area": "area_c", "type": "motion"},
+                "binary_sensor.motion_d": {"area": "area_d", "type": "motion"},
+            },
+        }
+    }
 
 
 @pytest.fixture
@@ -211,19 +279,39 @@ async def loop(hass: HomeAssistant, loop_config):
 
 class TestLoop:
     async def test_half_traversal(self, loop: HomeAssistant):
-        c = loop.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = loop.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_a", False)
         h.trigger_sensor("binary_sensor.motion_c", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_b", False)
         assert c.get_occupancy("area_c") == 1
-        assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c", "area_d"]) == 1
+        assert (
+            sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c", "area_d"])
+            == 1
+        )
 
 
 @pytest.fixture
 def t_config():
-    return {DOMAIN: {"areas": {"area_a": {"name": "A", "exit_capable": True}, "area_b": {"name": "B"}, "area_c": {"name": "C"}, "area_d": {"name": "D"}}, "adjacency": {"area_a": ["area_b"], "area_b": ["area_c", "area_d"]}, "sensors": {"binary_sensor.motion_a": {"area": "area_a", "type": "motion"}, "binary_sensor.motion_b": {"area": "area_b", "type": "motion"}, "binary_sensor.motion_c": {"area": "area_c", "type": "motion"}, "binary_sensor.motion_d": {"area": "area_d", "type": "motion"}}}}
+    return {
+        DOMAIN: {
+            "areas": {
+                "area_a": {"name": "A", "exit_capable": True},
+                "area_b": {"name": "B"},
+                "area_c": {"name": "C"},
+                "area_d": {"name": "D"},
+            },
+            "adjacency": {"area_a": ["area_b"], "area_b": ["area_c", "area_d"]},
+            "sensors": {
+                "binary_sensor.motion_a": {"area": "area_a", "type": "motion"},
+                "binary_sensor.motion_b": {"area": "area_b", "type": "motion"},
+                "binary_sensor.motion_c": {"area": "area_c", "type": "motion"},
+                "binary_sensor.motion_d": {"area": "area_d", "type": "motion"},
+            },
+        }
+    }
 
 
 @pytest.fixture
@@ -234,7 +322,8 @@ async def t_junction(hass: HomeAssistant, t_config):
 
 class TestTJunction:
     async def test_turn(self, t_junction: HomeAssistant):
-        c = t_junction.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = t_junction.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_a", False)
@@ -243,7 +332,8 @@ class TestTJunction:
         assert c.get_occupancy("area_c") == 1
 
     async def test_straight(self, t_junction: HomeAssistant):
-        c = t_junction.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = t_junction.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=1)
         h.trigger_sensor("binary_sensor.motion_a", False)
@@ -269,7 +359,8 @@ class TestThreeOccupants:
         So we can only get 2 separate claims with this topology.
         Accept the limitation and verify total occupancy = 2.
         """
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         # P1: A -> B -> C
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=1)
@@ -295,7 +386,20 @@ class TestThreeOccupants:
 
 @pytest.fixture
 def multi_sensor_config():
-    return {DOMAIN: {"areas": {"entry": {"name": "Entry", "exit_capable": True}, "room": {"name": "Room"}}, "adjacency": {"entry": ["room"]}, "sensors": {"binary_sensor.pir": {"area": "room", "type": "motion"}, "binary_sensor.camera": {"area": "room", "type": "camera_person"}, "binary_sensor.entry_motion": {"area": "entry", "type": "motion"}}}}
+    return {
+        DOMAIN: {
+            "areas": {
+                "entry": {"name": "Entry", "exit_capable": True},
+                "room": {"name": "Room"},
+            },
+            "adjacency": {"entry": ["room"]},
+            "sensors": {
+                "binary_sensor.pir": {"area": "room", "type": "motion"},
+                "binary_sensor.camera": {"area": "room", "type": "camera_person"},
+                "binary_sensor.entry_motion": {"area": "entry", "type": "motion"},
+            },
+        }
+    }
 
 
 @pytest.fixture
@@ -306,7 +410,8 @@ async def multi_sensor(hass: HomeAssistant, multi_sensor_config):
 
 class TestMultiSensor:
     async def test_pir_off_camera_on(self, multi_sensor: HomeAssistant):
-        c = multi_sensor.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = multi_sensor.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.entry_motion", True)
         h.trigger_sensor("binary_sensor.pir", True, delay=1)
         h.trigger_sensor("binary_sensor.camera", True, delay=0.5)
@@ -317,7 +422,8 @@ class TestMultiSensor:
         assert c.get_occupancy("room") == 1
 
     async def test_all_off_then_move(self, multi_sensor: HomeAssistant):
-        c = multi_sensor.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = multi_sensor.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.entry_motion", True)
         h.trigger_sensor("binary_sensor.pir", True, delay=1)
         h.trigger_sensor("binary_sensor.entry_motion", False, delay=3)
@@ -328,7 +434,8 @@ class TestMultiSensor:
         assert c.get_occupancy("room") == 0
 
     async def test_camera_delayed(self, multi_sensor: HomeAssistant):
-        c = multi_sensor.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = multi_sensor.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.entry_motion", True)
         h.trigger_sensor("binary_sensor.pir", True, delay=1)
         assert c.get_occupancy("room") == 1
@@ -338,32 +445,67 @@ class TestMultiSensor:
 
 class TestPhantomCleanup:
     async def test_phantom_cleared(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         _set_occ(c.areas["area_c"], 1)
         c.areas["area_c"].last_motion = h.current_time - 12000
         c.areas["area_b"].last_motion = h.current_time - 3600
-        c.anomaly_detector.check_timeouts(c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 0.12)
+        c.anomaly_detector.check_timeouts(
+            c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 0.12
+        )
         assert c.get_occupancy("area_c") == 0
 
     async def test_not_cleared_neighbor(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         _set_occ(c.areas["area_c"], 1)
         c.areas["area_c"].last_motion = h.current_time - 12000
         c.areas["area_b"].last_motion = h.current_time - 60
-        c.anomaly_detector.check_timeouts(c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 0.12)
+        c.anomaly_detector.check_timeouts(
+            c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 0.12
+        )
         assert c.get_occupancy("area_c") == 1
 
     async def test_legitimate_not_cleared(self, linear: HomeAssistant):
-        c = linear.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = linear.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         _set_occ(c.areas["area_b"], 1)
         c.areas["area_b"].last_motion = h.current_time - 60
-        c.anomaly_detector.check_timeouts(c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 1.0)
+        c.anomaly_detector.check_timeouts(
+            c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 1.0
+        )
         assert c.get_occupancy("area_b") == 1
 
 
 @pytest.fixture
 def open_plan_config():
-    return {DOMAIN: {"areas": {"entry": {"name": "Entry", "exit_capable": True}, "corridor": {"name": "Corridor"}, "kitchen": {"name": "Kitchen"}, "dining": {"name": "Dining"}, "living": {"name": "Living"}}, "adjacency": {"entry": ["corridor"], "corridor": ["kitchen"], "kitchen": ["dining"], "dining": ["living"]}, "sensors": {"binary_sensor.entry": {"area": "entry", "type": "motion"}, "binary_sensor.corridor": {"area": "corridor", "type": "motion"}, "binary_sensor.kitchen": {"area": "kitchen", "type": "motion"}, "binary_sensor.dining": {"area": "dining", "type": "motion"}, "binary_sensor.living": {"area": "living", "type": "motion"}}, "open_plan_groups": {"open_plan": {"areas": ["kitchen", "dining", "living"]}}}}
+    return {
+        DOMAIN: {
+            "areas": {
+                "entry": {"name": "Entry", "exit_capable": True},
+                "corridor": {"name": "Corridor"},
+                "kitchen": {"name": "Kitchen"},
+                "dining": {"name": "Dining"},
+                "living": {"name": "Living"},
+            },
+            "adjacency": {
+                "entry": ["corridor"],
+                "corridor": ["kitchen"],
+                "kitchen": ["dining"],
+                "dining": ["living"],
+            },
+            "sensors": {
+                "binary_sensor.entry": {"area": "entry", "type": "motion"},
+                "binary_sensor.corridor": {"area": "corridor", "type": "motion"},
+                "binary_sensor.kitchen": {"area": "kitchen", "type": "motion"},
+                "binary_sensor.dining": {"area": "dining", "type": "motion"},
+                "binary_sensor.living": {"area": "living", "type": "motion"},
+            },
+            "open_plan_groups": {
+                "open_plan": {"areas": ["kitchen", "dining", "living"]}
+            },
+        }
+    }
 
 
 @pytest.fixture
@@ -374,7 +516,8 @@ async def open_plan(hass: HomeAssistant, open_plan_config):
 
 class TestOpenPlan:
     async def test_no_inflation(self, open_plan: HomeAssistant):
-        c = open_plan.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = open_plan.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.entry", True)
         h.trigger_sensor("binary_sensor.corridor", True, delay=1)
         h.trigger_sensor("binary_sensor.kitchen", True, delay=1)
@@ -385,7 +528,8 @@ class TestOpenPlan:
         assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) == 1
 
     async def test_leave_via_corridor(self, open_plan: HomeAssistant):
-        c = open_plan.data[DOMAIN]["coordinator"]; h = SensorEventHelper(c)
+        c = open_plan.data[DOMAIN]["coordinator"]
+        h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.entry", True)
         h.trigger_sensor("binary_sensor.corridor", True, delay=1)
         h.trigger_sensor("binary_sensor.kitchen", True, delay=1)
@@ -396,4 +540,10 @@ class TestOpenPlan:
         h.trigger_sensor("binary_sensor.dining", False, delay=1)
         h.trigger_sensor("binary_sensor.corridor", True, delay=3)
         assert c.get_occupancy("corridor") == 1
-        assert sum(c.get_occupancy(a) for a in ["entry", "corridor", "kitchen", "dining", "living"]) == 1
+        assert (
+            sum(
+                c.get_occupancy(a)
+                for a in ["entry", "corridor", "kitchen", "dining", "living"]
+            )
+            == 1
+        )
