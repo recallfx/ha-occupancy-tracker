@@ -376,6 +376,48 @@ def test_kitchen_dining_oscillation_production():
 
 
 # ==================================================================
+# TEST 2b: Guest-room first motion from open-plan area.
+#
+# Production: guest_room_motion fired while kitchen/dining/living were
+# active, but entrance was off and last fired 277.6s earlier. The first
+# guest-room pulse must be accepted; otherwise lights wait for the
+# persistent-activation fallback.
+# ==================================================================
+
+def test_guest_room_first_motion_accepts_recent_entrance_path():
+    """Guest room should not wait for a second KNX pulse when entrance is stale but recent."""
+    resolver, areas, sensors, detector, now = _make_system()
+
+    # Person entered through entrance and reached open-plan.
+    _fire(resolver, sensors, areas, "binary_sensor.entrance_motion", True, now, detector)
+    _fire(resolver, sensors, areas, "binary_sensor.kitchen_motion", True, now + 3.7, detector)
+    _fire(resolver, sensors, areas, "binary_sensor.dining_room_motion", True, now + 4.5, detector)
+    _fire(resolver, sensors, areas, "binary_sensor.living_room_motion", True, now + 5.0, detector)
+    _fire(resolver, sensors, areas, "binary_sensor.entrance_motion", False, now + 5.0, detector)
+    assert _open_plan_occupancy(areas) == 1
+
+    # Same shape as the observed failure: guest motion happens after bootstrap
+    # expired, entrance is off, and entrance last ON is still within 5 minutes.
+    guest_time = now + 277.6
+    _fire(
+        resolver,
+        sensors,
+        areas,
+        "binary_sensor.guest_room_motion",
+        True,
+        guest_time,
+        detector,
+    )
+
+    assert areas["guest_room"].occupancy == 1
+    assert not [
+        warning
+        for warning in detector.get_warnings()
+        if warning.area == "guest_room" and "no_plausible_source" in warning.message
+    ]
+
+
+# ==================================================================
 # TEST 3: The 18:40 return walk — kitchen → entrance → corridor_1
 #          → corridor_2 → bedroom_1
 #

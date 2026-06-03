@@ -566,6 +566,12 @@ class MapOccupancyResolver:
             if neighbor.occupied:
                 return True
 
+            if (
+                neighbor.last_occupied_at > 0
+                and (timestamp - neighbor.last_occupied_at) <= self.RECENTLY_OCCUPIED_WINDOW
+            ):
+                return True
+
             if neighbor_id in self.retained:
                 return True
 
