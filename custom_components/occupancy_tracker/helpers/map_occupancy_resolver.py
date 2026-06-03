@@ -386,6 +386,11 @@ class MapOccupancyResolver:
         # =============================================
         previously_occupied = {aid for aid, a in areas.items() if a.occupied}
 
+        displaced: set[str] = self._stale_recent_source_displacements(
+            occupied_areas, clusters, sensor_active_areas, timestamp, areas
+        )
+        occupied_areas -= displaced
+
         # Identify which occupied leaders came from retained (not from an
         # active sensor). These are candidates for displacement.
         # Areas with active sensors are sensor-based even if also retained —
@@ -405,7 +410,6 @@ class MapOccupancyResolver:
         # paths through stale intermediates are ambiguous and risk
         # displacing the wrong person.
         multi_retained = len(retained_leaders) > 1
-        displaced: set[str] = set()
         for ret_leader in retained_leaders:
             # Never displace a retained area whose sensor is currently ON —
             # the person is clearly still there (e.g., sitting in study
@@ -541,6 +545,74 @@ class MapOccupancyResolver:
             _LOGGER.debug(
                 f"Rebuild @ {timestamp:.1f}: occupied={occ}, retained={set(self.retained.keys())}"
             )
+
+    def _stale_recent_source_displacements(
+        self,
+        occupied_areas: set[str],
+        clusters: list[set[str]],
+        sensor_active_areas: set[str],
+        timestamp: float,
+        areas: Dict[str, AreaState],
+    ) -> set[str]:
+        displaced: set[str] = set()
+        cluster_by_area = {
+            area_id: cluster for cluster in clusters for area_id in cluster
+        }
+
+        for destination_id in sensor_active_areas:
+            destination = areas.get(destination_id)
+            destination_cluster = cluster_by_area.get(destination_id)
+            if not destination or not destination_cluster:
+                continue
+
+            for bridge_id in self._recent_inactive_bridges(
+                destination_id, timestamp, areas, sensor_active_areas
+            ):
+                bridge_neighbors = set(self.adjacency_map.get(bridge_id, []))
+                for cluster in clusters:
+                    if cluster is destination_cluster:
+                        continue
+                    leaders = cluster & occupied_areas
+                    if not leaders:
+                        continue
+                    if not (cluster & bridge_neighbors):
+                        continue
+
+                    latest_motion = max(areas[aid].last_motion for aid in cluster)
+                    if latest_motion >= destination.last_motion:
+                        continue
+                    if (timestamp - latest_motion) <= self.RECENT_MOTION_WINDOW:
+                        continue
+
+                    displaced.update(leaders)
+
+        return displaced
+
+    def _recent_inactive_bridges(
+        self,
+        area_id: str,
+        timestamp: float,
+        areas: Dict[str, AreaState],
+        sensor_active_areas: set[str],
+    ) -> list[str]:
+        bridges: list[str] = []
+        for neighbor_id in self.adjacency_map.get(area_id, []):
+            if neighbor_id in sensor_active_areas:
+                continue
+            if neighbor_id in self.retained:
+                continue
+
+            neighbor = areas.get(neighbor_id)
+            if not neighbor or neighbor.occupied:
+                continue
+            if (
+                neighbor.last_occupied_at > 0
+                and (timestamp - neighbor.last_occupied_at)
+                <= self.RECENTLY_OCCUPIED_WINDOW
+            ):
+                bridges.append(neighbor_id)
+
+        return bridges
 
     # ------------------------------------------------------------------
     # Phase 1: Build active areas with phantom rejection

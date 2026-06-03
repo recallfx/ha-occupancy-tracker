@@ -800,6 +800,8 @@ def test_guest_room_first_motion_accepts_recent_entrance_path():
     )
 
     assert areas["guest_room"].occupancy == 1
+    assert _open_plan_occupancy(areas) == 0
+    assert _total_occupancy(areas) == 1
     assert not [
         warning
         for warning in detector.get_warnings()
