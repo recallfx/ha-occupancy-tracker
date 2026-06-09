@@ -91,8 +91,9 @@ class AnomalyDetector:
         timestamp: float,
         sensors: Optional[Dict[str, SensorState]] = None,
         probability_fn: Optional[Callable[[str, float], float]] = None,
-    ) -> None:
+    ) -> List[str]:
         """Check for timeout conditions like inactivity and extended occupancy."""
+        cleared_area_ids: List[str] = []
 
         for area_id, area in areas.items():
             # Check exit-capable areas for auto-clear (shorter timeout)
@@ -150,7 +151,11 @@ class AnomalyDetector:
                         )
 
         if sensors is not None and probability_fn is not None:
-            self._check_phantom_occupancy(areas, timestamp, sensors, probability_fn)
+            cleared_area_ids.extend(
+                self._check_phantom_occupancy(areas, timestamp, sensors, probability_fn)
+            )
+
+        return cleared_area_ids
 
     def _check_phantom_occupancy(
         self,
@@ -158,7 +163,7 @@ class AnomalyDetector:
         timestamp: float,
         sensors: Dict[str, SensorState],
         probability_fn: Callable[[str, float], float],
-    ) -> None:
+    ) -> List[str]:
         """Clear occupancy when all evidence suggests a phantom occupant.
 
         Only clears when ALL conditions are true:
@@ -168,6 +173,8 @@ class AnomalyDetector:
         4. No recent magnetic events (door/window)
         5. Area is not exit-capable
         """
+        cleared_area_ids: List[str] = []
+
         for area_id, area in areas.items():
             if area.occupancy <= 0:
                 continue
@@ -237,6 +244,7 @@ class AnomalyDetector:
                 f"no neighbor activity, no recent magnetic events"
             )
             area.clear_occupancy(timestamp)
+            cleared_area_ids.append(area_id)
             self._create_warning(
                 "phantom_occupancy_cleared",
                 f"Phantom occupancy cleared in {area_id} after "
@@ -245,6 +253,8 @@ class AnomalyDetector:
                 area=area_id,
                 timestamp=timestamp,
             )
+
+        return cleared_area_ids
 
     def _create_warning(
         self,
