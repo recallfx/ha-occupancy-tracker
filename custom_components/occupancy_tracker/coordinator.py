@@ -237,12 +237,13 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         """Check for timeout conditions."""
         if timestamp is None:
             timestamp = time.time()
-        self.anomaly_detector.check_timeouts(
+        cleared_area_ids = self.anomaly_detector.check_timeouts(
             self.areas,
             timestamp,
             sensors=self.sensors,
             probability_fn=self.get_occupancy_probability,
         )
+        self._clear_resolver_retention(cleared_area_ids)
         self.state_recorder.maybe_record_tick(
             timestamp,
             self.areas,
@@ -398,12 +399,13 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
         old_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
 
-        self.anomaly_detector.check_timeouts(
+        cleared_area_ids = self.anomaly_detector.check_timeouts(
             self.areas,
             timestamp,
             sensors=self.sensors,
             probability_fn=self.get_occupancy_probability,
         )
+        self._clear_resolver_retention(cleared_area_ids)
 
         new_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
         if old_occupancy != new_occupancy:
@@ -415,3 +417,8 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 _LOGGER.info(f"⏱️ periodic | {changes} | {state_view}")
 
         return self.diagnostics.get_system_status()
+
+    def _clear_resolver_retention(self, area_ids: List[str]) -> None:
+        """Remove areas phantom cleanup already cleared from resolver retention."""
+        for area_id in area_ids:
+            self.occupancy_resolver.retained.pop(area_id, None)

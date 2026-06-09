@@ -81,3 +81,32 @@ def test_probability_zero_occupancy(coordinator):
 
 def test_unknown_area(coordinator):
     assert coordinator.get_occupancy_probability("unknown_area") == 0.0
+
+
+def test_check_timeouts_removes_phantom_from_resolver_retention():
+    hass = Mock(spec=HomeAssistant)
+    now = 100000.0
+    config = {
+        "areas": {
+            "bathroom": {"name": "Bathroom"},
+            "hallway": {"name": "Hallway"},
+        },
+        "adjacency": {
+            "bathroom": ["hallway"],
+        },
+        "sensors": {
+            "sensor.bathroom_motion": {"area": "bathroom", "type": "motion"},
+            "sensor.hallway_motion": {"area": "hallway", "type": "motion"},
+        },
+    }
+    coordinator = OccupancyCoordinator(hass, config, enable_periodic_updates=False)
+
+    _set_occupancy(coordinator.areas["bathroom"], 1)
+    coordinator.areas["bathroom"].last_motion = now - 12000
+    coordinator.areas["hallway"].last_motion = now - 3600
+    coordinator.occupancy_resolver.retained["bathroom"] = now - 12000
+
+    coordinator.check_timeouts(now)
+
+    assert coordinator.areas["bathroom"].occupancy == 0
+    assert "bathroom" not in coordinator.occupancy_resolver.retained
