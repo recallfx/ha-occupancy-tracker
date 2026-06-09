@@ -392,10 +392,11 @@ class TestPhantomOccupancyCleanup:
 
         now = self.BASE_TIME
 
-        detector.check_timeouts(
+        cleared_area_ids = detector.check_timeouts(
             areas, now, sensors=sensors, probability_fn=self._low_probability
         )
 
+        assert cleared_area_ids == ["bedroom"]
         assert areas["bedroom"].occupancy == 0
         warnings = [
             w for w in detector.get_warnings() if w.type == "phantom_occupancy_cleared"

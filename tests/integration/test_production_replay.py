@@ -80,6 +80,12 @@ def _assert_no_area_above(areas, max_occ, context=""):
         )
 
 
+def test_bedroom2_corridor2_overlap_is_modelled():
+    """Bedroom 2 can plausibly spill with the rear corridor sensor."""
+    assert "bedroom_2" in PRODUCTION_CONFIG["adjacency"]["corridor_2"]
+    assert "corridor_2" in PRODUCTION_CONFIG["adjacency"]["bedroom_2"]
+
+
 # ------------------------------------------------------------------
 # Full production config (21 areas, all sensors, all adjacency)
 # ------------------------------------------------------------------
@@ -135,12 +141,18 @@ PRODUCTION_CONFIG = {
         "guest_room": ["entrance"],
         "workshop": ["entrance", "garage", "right_side"],
         "corridor_1": ["entrance", "corridor_2", "study", "bedroom_2", "bathroom"],
-        "corridor_2": ["corridor_1", "bedroom_1", "main_bedroom", "utility_room"],
+        "corridor_2": [
+            "corridor_1",
+            "bedroom_1",
+            "bedroom_2",
+            "main_bedroom",
+            "utility_room",
+        ],
         "kitchen": ["entrance", "dining_room", "living", "backyard"],
         "dining_room": ["kitchen", "living"],
         "living": ["kitchen", "dining_room"],
         "study": ["corridor_1"],
-        "bedroom_2": ["corridor_1"],
+        "bedroom_2": ["corridor_1", "corridor_2"],
         "bathroom": ["corridor_1"],
         "bedroom_1": ["corridor_2", "left_side"],
         "utility_room": ["corridor_2", "left_side"],
