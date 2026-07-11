@@ -47,6 +47,52 @@ class TestSensorState:
         assert sensor.current_state is False
         assert sensor.last_changed == 0  # Never changed from init
 
+    def test_mark_unavailable_does_not_create_false_edge(self):
+        """Availability loss invalidates state without changing event history."""
+        timestamp = time.time()
+        sensor = SensorState("sensor.motion_1", {}, timestamp)
+        sensor.update_state(True, timestamp + 1)
+        last_changed = sensor.last_changed
+        activated_at = sensor.activated_at
+        history = list(sensor.history)
+
+        sensor.mark_unavailable(timestamp + 2)
+
+        assert sensor.current_state is True
+        assert sensor.activated_at == activated_at
+        assert sensor.is_available is False
+        assert sensor.is_reliable is True
+        assert sensor.is_trusted_active is False
+        assert sensor.last_changed == last_changed
+        assert sensor.history == history
+
+    def test_valid_unchanged_state_restores_availability(self):
+        """The first valid state after an outage restores availability."""
+        timestamp = time.time()
+        sensor = SensorState("sensor.motion_1", {}, timestamp)
+        sensor.mark_unavailable(timestamp + 1)
+
+        changed = sensor.update_state(False, timestamp + 2)
+
+        assert changed is False
+        assert sensor.current_state is False
+        assert sensor.is_available is True
+        assert sensor.is_reliable is True
+
+    def test_repeated_state_does_not_restore_stuck_sensor(self):
+        """Availability recovery must not re-trust an unchanged stuck sensor."""
+        timestamp = time.time()
+        sensor = SensorState("sensor.motion_1", {}, timestamp)
+        sensor.update_state(True, timestamp + 1)
+        sensor.is_stuck = True
+        sensor.is_reliable = False
+
+        changed = sensor.update_state(True, timestamp + 2)
+
+        assert changed is False
+        assert sensor.is_stuck is True
+        assert sensor.is_reliable is False
+
     def test_state_transitions(self):
         """Test multiple state transitions."""
         sensor = SensorState("sensor.door_1", {}, time.time())

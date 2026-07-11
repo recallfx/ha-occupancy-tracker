@@ -108,7 +108,7 @@ class MapOccupancyResolver:
         """Compute the set of area IDs that have at least one active motion/camera sensor."""
         active: set[str] = set()
         for sensor in sensors.values():
-            if not sensor.current_state:
+            if not sensor.is_trusted_active:
                 continue
             if sensor.config.get("type", "") not in MOTION_SENSOR_TYPES:
                 continue
@@ -118,7 +118,7 @@ class MapOccupancyResolver:
     def _is_area_active(self, area_id: str, sensors: Dict[str, SensorState]) -> bool:
         """Check if any MOTION/CAMERA sensor in the area is currently ON."""
         for sensor in sensors.values():
-            if not sensor.current_state:
+            if not sensor.is_trusted_active:
                 continue
             if sensor.config.get("type", "") not in MOTION_SENSOR_TYPES:
                 continue
@@ -132,7 +132,7 @@ class MapOccupancyResolver:
         for sensor in sensors.values():
             if sensor.id == exclude_sensor_id:
                 continue
-            if not sensor.current_state:
+            if not sensor.is_trusted_active:
                 continue
             if sensor.config.get("type", "") not in MOTION_SENSOR_TYPES:
                 continue
@@ -167,6 +167,42 @@ class MapOccupancyResolver:
         sensor_id = parts[1]
         new_state = parts[2] == "on"
         return sensor_id, new_state
+
+    @staticmethod
+    def _parse_availability_event(
+        snapshot: MapSnapshot,
+    ) -> Optional[Tuple[str, bool]]:
+        if snapshot.event_type != "availability" or not snapshot.description:
+            return None
+        parts = snapshot.description.split(":")
+        if len(parts) != 3 or parts[0] != "availability":
+            return None
+        return parts[1], parts[2] == "available"
+
+    @staticmethod
+    def _parse_baseline_event(
+        snapshot: MapSnapshot,
+    ) -> Optional[Tuple[str, bool]]:
+        if snapshot.event_type != "baseline" or not snapshot.description:
+            return None
+        parts = snapshot.description.split(":")
+        if len(parts) != 3 or parts[0] != "baseline":
+            return None
+        return parts[1], parts[2] == "on"
+
+    @staticmethod
+    def _restore_snapshot_sensor_metadata(
+        snapshot: MapSnapshot,
+        sensors: Dict[str, SensorState],
+    ) -> None:
+        """Restore non-physical trust state for deterministic replay."""
+        for sensor_id, data in snapshot.sensors.items():
+            sensor = sensors.get(sensor_id)
+            if not sensor:
+                continue
+            sensor.is_available = data.get("available", sensor.is_available)
+            sensor.is_reliable = data.get("reliable", sensor.is_reliable)
+            sensor.is_stuck = data.get("stuck", sensor.is_stuck)
 
     def process_snapshot(
         self,
@@ -224,6 +260,24 @@ class MapOccupancyResolver:
             area.activity_history = []
 
         for snapshot in history:
+            baseline = self._parse_baseline_event(snapshot)
+            if baseline:
+                sensor_id, state = baseline
+                sensor = sensors.get(sensor_id)
+                if sensor:
+                    sensor.seed_state(state, snapshot.timestamp)
+                self._restore_snapshot_sensor_metadata(snapshot, sensors)
+                continue
+
+            availability = self._parse_availability_event(snapshot)
+            if availability:
+                sensor_id, is_available = availability
+                sensor = sensors.get(sensor_id)
+                if sensor:
+                    sensor.is_available = is_available
+                self._restore_snapshot_sensor_metadata(snapshot, sensors)
+                continue
+
             event = self._parse_sensor_event(snapshot)
             if event:
                 sensor_id, new_state = event
@@ -231,6 +285,7 @@ class MapOccupancyResolver:
                 if sensor:
                     sensor.update_state(new_state, snapshot.timestamp)
             self.process_snapshot(snapshot, areas, sensors, anomaly_detector)
+            self._restore_snapshot_sensor_metadata(snapshot, sensors)
 
     # ------------------------------------------------------------------
     # Magnetic events
