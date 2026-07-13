@@ -11,6 +11,7 @@ from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
+from .helpers.constants import MOTION_SENSOR_TYPES
 from .helpers.types import OccupancyTrackerConfig
 from .helpers.anomaly_detector import AnomalyDetector
 from .helpers.warning import Warning
@@ -105,11 +106,18 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         old_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
 
         # Update sensor state
+        was_available = sensor.is_available
         state_changed = sensor.update_state(state, timestamp)
 
-        # Skip processing if state didn't actually change, unless it's an ON event (keep-alive)
-        # We want to process repeated ON events to update last_motion and confirm presence
-        if not state_changed and not state:
+        # Repeated ON is useful as presence keep-alive only for motion sensors.
+        if not state_changed and (
+            not state
+            or sensor_type not in MOTION_SENSOR_TYPES
+            or not sensor.is_trusted_active
+        ):
+            if not was_available:
+                self._record_sensor_availability(sensor_id, True, timestamp)
+                self.async_set_updated_data(self.diagnostics.get_system_status())
             return
 
         # Record snapshot
@@ -123,16 +131,59 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 snapshot, self.areas, self.sensors, self.anomaly_detector
             )
 
-            self._refresh_latest_snapshot_state()  # Log detailed state changes
+            # Check for stuck sensors after processing
+            self._check_for_stuck_sensors(sensor_id, timestamp)
+
+            # Persist trust changes made by anomaly detection in this event's
+            # replayable snapshot.
+            self._refresh_latest_snapshot_state()
             self._log_state_change(
                 sensor_id, sensor_type, state, area_ids, old_occupancy, timestamp
             )
 
-            # Check for stuck sensors after processing
-            self._check_for_stuck_sensors(sensor_id, timestamp)
-
             self.last_event_time = timestamp
             self.async_set_updated_data(self.diagnostics.get_system_status())
+
+    def invalidate_sensor_state(self, sensor_id: str, timestamp: float) -> None:
+        """Stop trusting cached state without inventing a physical OFF edge."""
+        sensor = self.sensors.get(sensor_id)
+        if sensor is None:
+            _LOGGER.warning("Unknown sensor ID: %s", sensor_id)
+            return
+
+        was_available = sensor.is_available
+        sensor.mark_unavailable(timestamp)
+        if was_available:
+            self._record_sensor_availability(sensor_id, False, timestamp)
+        self.async_set_updated_data(self.diagnostics.get_system_status())
+
+    def seed_sensor_state(self, sensor_id: str, state: bool, timestamp: float) -> None:
+        """Set an initial HA state without replaying it as a fresh edge."""
+        sensor = self.sensors.get(sensor_id)
+        if sensor is None:
+            _LOGGER.warning("Unknown sensor ID: %s", sensor_id)
+            return
+        sensor.seed_state(state, timestamp)
+        if state:
+            self.state_recorder.record_sensor_baseline(
+                timestamp=timestamp,
+                sensor_id=sensor_id,
+                state=state,
+                areas=self.areas,
+                sensors=self.sensors,
+            )
+
+    def _record_sensor_availability(
+        self, sensor_id: str, available: bool, timestamp: float
+    ) -> None:
+        """Persist availability for deterministic state replay."""
+        self.state_recorder.record_sensor_availability(
+            timestamp=timestamp,
+            sensor_id=sensor_id,
+            available=available,
+            areas=self.areas,
+            sensors=self.sensors,
+        )
 
     def _record_snapshot(
         self, sensor_id: str, state: bool, timestamp: float
@@ -335,7 +386,13 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             aid: (area.occupancy, area.last_motion) for aid, area in self.areas.items()
         }
         original_sensors = {
-            sid: (sensor.current_state, sensor.last_changed)
+            sid: (
+                sensor.current_state,
+                sensor.last_changed,
+                sensor.is_available,
+                sensor.is_reliable,
+                sensor.is_stuck,
+            )
             for sid, sensor in self.sensors.items()
         }
 
@@ -349,6 +406,9 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             for sensor in self.sensors.values():
                 sensor.current_state = False
                 sensor.history = []
+                sensor.is_available = True
+                sensor.is_reliable = True
+                sensor.is_stuck = False
 
             self.occupancy_resolver.reset()
 
@@ -384,10 +444,19 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                     self.areas[aid].occupancy = occ
                     self.areas[aid].last_motion = motion
 
-            for sid, (state, changed) in original_sensors.items():
+            for sid, (
+                state,
+                changed,
+                available,
+                reliable,
+                stuck,
+            ) in original_sensors.items():
                 if sid in self.sensors:
                     self.sensors[sid].current_state = state
                     self.sensors[sid].last_changed = changed
+                    self.sensors[sid].is_available = available
+                    self.sensors[sid].is_reliable = reliable
+                    self.sensors[sid].is_stuck = stuck
 
     def diagnose_motion_issues(self, sensor_id: str = None) -> Dict[str, Any]:
         """Diagnostic method to help identify why motion isn't being detected."""

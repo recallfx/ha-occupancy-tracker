@@ -51,6 +51,9 @@ class MapOccupancyResolver:
 
     def __init__(self, config: OccupancyTrackerConfig) -> None:
         self.adjacency_map = self._build_adjacency(config)
+        self._area_order = {
+            area_id: index for index, area_id in enumerate(config.get("areas", {}))
+        }
         self.open_plan_groups: Dict[str, List[str]] = self._build_open_plan_groups(
             config
         )
@@ -108,7 +111,7 @@ class MapOccupancyResolver:
         """Compute the set of area IDs that have at least one active motion/camera sensor."""
         active: set[str] = set()
         for sensor in sensors.values():
-            if not sensor.current_state:
+            if not sensor.is_trusted_active:
                 continue
             if sensor.config.get("type", "") not in MOTION_SENSOR_TYPES:
                 continue
@@ -118,7 +121,7 @@ class MapOccupancyResolver:
     def _is_area_active(self, area_id: str, sensors: Dict[str, SensorState]) -> bool:
         """Check if any MOTION/CAMERA sensor in the area is currently ON."""
         for sensor in sensors.values():
-            if not sensor.current_state:
+            if not sensor.is_trusted_active:
                 continue
             if sensor.config.get("type", "") not in MOTION_SENSOR_TYPES:
                 continue
@@ -132,7 +135,7 @@ class MapOccupancyResolver:
         for sensor in sensors.values():
             if sensor.id == exclude_sensor_id:
                 continue
-            if not sensor.current_state:
+            if not sensor.is_trusted_active:
                 continue
             if sensor.config.get("type", "") not in MOTION_SENSOR_TYPES:
                 continue
@@ -167,6 +170,42 @@ class MapOccupancyResolver:
         sensor_id = parts[1]
         new_state = parts[2] == "on"
         return sensor_id, new_state
+
+    @staticmethod
+    def _parse_availability_event(
+        snapshot: MapSnapshot,
+    ) -> Optional[Tuple[str, bool]]:
+        if snapshot.event_type != "availability" or not snapshot.description:
+            return None
+        parts = snapshot.description.split(":")
+        if len(parts) != 3 or parts[0] != "availability":
+            return None
+        return parts[1], parts[2] == "available"
+
+    @staticmethod
+    def _parse_baseline_event(
+        snapshot: MapSnapshot,
+    ) -> Optional[Tuple[str, bool]]:
+        if snapshot.event_type != "baseline" or not snapshot.description:
+            return None
+        parts = snapshot.description.split(":")
+        if len(parts) != 3 or parts[0] != "baseline":
+            return None
+        return parts[1], parts[2] == "on"
+
+    @staticmethod
+    def _restore_snapshot_sensor_metadata(
+        snapshot: MapSnapshot,
+        sensors: Dict[str, SensorState],
+    ) -> None:
+        """Restore non-physical trust state for deterministic replay."""
+        for sensor_id, data in snapshot.sensors.items():
+            sensor = sensors.get(sensor_id)
+            if not sensor:
+                continue
+            sensor.is_available = data.get("available", sensor.is_available)
+            sensor.is_reliable = data.get("reliable", sensor.is_reliable)
+            sensor.is_stuck = data.get("stuck", sensor.is_stuck)
 
     def process_snapshot(
         self,
@@ -224,6 +263,24 @@ class MapOccupancyResolver:
             area.activity_history = []
 
         for snapshot in history:
+            baseline = self._parse_baseline_event(snapshot)
+            if baseline:
+                sensor_id, state = baseline
+                sensor = sensors.get(sensor_id)
+                if sensor:
+                    sensor.seed_state(state, snapshot.timestamp)
+                self._restore_snapshot_sensor_metadata(snapshot, sensors)
+                continue
+
+            availability = self._parse_availability_event(snapshot)
+            if availability:
+                sensor_id, is_available = availability
+                sensor = sensors.get(sensor_id)
+                if sensor:
+                    sensor.is_available = is_available
+                self._restore_snapshot_sensor_metadata(snapshot, sensors)
+                continue
+
             event = self._parse_sensor_event(snapshot)
             if event:
                 sensor_id, new_state = event
@@ -231,6 +288,7 @@ class MapOccupancyResolver:
                 if sensor:
                     sensor.update_state(new_state, snapshot.timestamp)
             self.process_snapshot(snapshot, areas, sensors, anomaly_detector)
+            self._restore_snapshot_sensor_metadata(snapshot, sensors)
 
     # ------------------------------------------------------------------
     # Magnetic events
@@ -264,28 +322,26 @@ class MapOccupancyResolver:
         anomaly_detector: Optional[AnomalyDetector],
     ) -> Optional[str]:
         """Handle motion sensor turning ON — update timestamp and rebuild clusters."""
-        area_id = sensor.config.get("area")
-        if not area_id:
+        area_ids = [area_id for area_id in sensor.area_ids if area_id in areas]
+        if not area_ids:
             return None
 
-        area = areas.get(area_id)
-        if not area:
-            return None
-
-        area.last_motion = timestamp
+        for area_id in area_ids:
+            areas[area_id].last_motion = timestamp
 
         # Track the very first activation for bootstrap window calculation
         if self._first_activation_time == 0.0:
             self._first_activation_time = timestamp
 
         # If this area was retained, refresh retention timestamp
-        if area_id in self.retained:
-            self.retained[area_id] = timestamp
+        for area_id in area_ids:
+            if area_id in self.retained:
+                self.retained[area_id] = timestamp
 
         # Rebuild clusters and set occupancy
         self._rebuild_occupancy(timestamp, areas, sensors, anomaly_detector)
 
-        return area_id if area.occupied else None
+        return next((area_id for area_id in area_ids if areas[area_id].occupied), None)
 
     # ------------------------------------------------------------------
     # Motion-OFF handler
@@ -299,20 +355,19 @@ class MapOccupancyResolver:
         sensors: Dict[str, SensorState],
     ) -> Optional[str]:
         """Handle motion sensor turning OFF — rebuild clusters if all sensors off."""
-        area_id = sensor.config.get("area")
-        if not area_id:
+        area_ids = [area_id for area_id in sensor.area_ids if area_id in areas]
+        if not area_ids:
             return None
 
-        area = areas.get(area_id)
-        if not area:
-            return None
-
-        area.last_off = timestamp
+        for area_id in area_ids:
+            areas[area_id].last_off = timestamp
 
         # If other motion sensors in this area are still ON, skip rebuild
-        if self._any_other_motion_sensor_active(area_id, sensor.id, sensors):
+        if len(area_ids) == 1 and self._any_other_motion_sensor_active(
+            area_ids[0], sensor.id, sensors
+        ):
             _LOGGER.debug(
-                f"Motion-OFF in {area_id}: other sensor still active, skipping"
+                "Motion-OFF in %s: other sensor still active, skipping", area_ids[0]
             )
             return None
 
@@ -661,6 +716,10 @@ class MapOccupancyResolver:
         if area.is_exit_capable:
             return True
 
+        # With no neighbors, this area's own sensor is the only possible source.
+        if not self.adjacency_map.get(area_id):
+            return True
+
         # Already occupied or retained
         if area.occupied or area_id in self.retained:
             return True
@@ -857,6 +916,13 @@ class MapOccupancyResolver:
         timestamp: float,
     ) -> str:
         """Pick the occupied area within a cluster (most recent non-transition)."""
+
+        def leader_key(area_id: str) -> tuple[float, int]:
+            return (
+                areas[area_id].last_motion,
+                -self._area_order.get(area_id, len(self._area_order)),
+            )
+
         # Prefer non-transition areas with very recent motion
         non_transition = [
             aid
@@ -865,15 +931,15 @@ class MapOccupancyResolver:
             and (timestamp - areas[aid].last_motion) <= self.CLUSTER_MERGE_WINDOW
         ]
         if non_transition:
-            return max(non_transition, key=lambda aid: areas[aid].last_motion)
+            return max(non_transition, key=leader_key)
 
         # Fall back to any non-transition area
         non_transition_all = [aid for aid in cluster if not areas[aid].is_transition]
         if non_transition_all:
-            return max(non_transition_all, key=lambda aid: areas[aid].last_motion)
+            return max(non_transition_all, key=leader_key)
 
         # All transition — pick most recent
-        return max(cluster, key=lambda aid: areas[aid].last_motion)
+        return max(cluster, key=leader_key)
 
     # ------------------------------------------------------------------
     # Displacement: BFS from retained leader to sensor-based leader

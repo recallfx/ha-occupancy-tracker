@@ -17,6 +17,7 @@ from homeassistant.helpers.event import (
 from datetime import timedelta
 
 from .const import DOMAIN
+from .helpers.constants import MOTION_SENSOR_TYPES
 from .helpers.types import OccupancyTrackerConfig
 from .coordinator import OccupancyCoordinator
 
@@ -186,16 +187,18 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         sensors = occupancy_config.get("sensors", {})
         if entity_id in sensors:
+            timestamp = time.time()
+
             # Handle sensor unavailability
             if new_state is None or new_state.state in ["unavailable", "unknown"]:
                 _LOGGER.warning(
-                    f"Sensor {entity_id} is unavailable or in unknown state, skipping event"
+                    f"Sensor {entity_id} is unavailable or in unknown state"
                 )
+                coordinator.invalidate_sensor_state(entity_id, timestamp=timestamp)
                 return
 
             # Interpret HA state: 'on' becomes True; any other value is False
             sensor_state = new_state.state.lower() == "on"
-            timestamp = time.time()
 
             # Log raw sensor event for replay testing
             _RAW_LOGGER.debug(
@@ -211,6 +214,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     sensor_entities = list(occupancy_config.get("sensors", {}).keys())
     if sensor_entities:
         async_track_state_change_event(hass, sensor_entities, state_change_listener)
+
+        # Restore states already present when the integration starts. Motion ON
+        # is live occupancy evidence; other states are only cached baselines.
+        startup_timestamp = time.time()
+        for index, entity_id in enumerate(sensor_entities):
+            timestamp = startup_timestamp + index * 0.000001
+            state = hass.states.get(entity_id)
+            sensor_type = occupancy_config["sensors"][entity_id].get("type", "")
+            if state is None or state.state in ["unavailable", "unknown"]:
+                coordinator.invalidate_sensor_state(entity_id, timestamp)
+            elif state.state == "on" and sensor_type in MOTION_SENSOR_TYPES:
+                coordinator.process_sensor_event(entity_id, True, timestamp=timestamp)
+            else:
+                coordinator.seed_sensor_state(
+                    entity_id,
+                    state.state.lower() == "on",
+                    timestamp,
+                )
 
     # Set up periodic check for timeouts (every 60 seconds)
     # Note: The coordinator also has a 5-second update_interval for consistency checks.

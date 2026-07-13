@@ -54,6 +54,50 @@ class MapStateRecorder:
         self.last_event_snapshot_time = timestamp
         return snapshot
 
+    def record_sensor_availability(
+        self,
+        timestamp: float,
+        sensor_id: str,
+        available: bool,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> MapSnapshot:
+        """Record availability without inventing a physical ON/OFF edge."""
+        description = (
+            f"availability:{sensor_id}:{'available' if available else 'unavailable'}"
+        )
+        snapshot = self._build_snapshot(
+            timestamp=timestamp,
+            event_type="availability",
+            description=description,
+            areas=areas,
+            sensors=sensors,
+        )
+        self.last_snapshot_time = timestamp
+        self.last_event_snapshot_time = timestamp
+        return snapshot
+
+    def record_sensor_baseline(
+        self,
+        timestamp: float,
+        sensor_id: str,
+        state: bool,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> MapSnapshot:
+        """Record a startup state without treating it as a fresh edge."""
+        description = f"baseline:{sensor_id}:{'on' if state else 'off'}"
+        snapshot = self._build_snapshot(
+            timestamp=timestamp,
+            event_type="baseline",
+            description=description,
+            areas=areas,
+            sensors=sensors,
+        )
+        self.last_snapshot_time = timestamp
+        self.last_event_snapshot_time = timestamp
+        return snapshot
+
     def maybe_record_tick(
         self,
         timestamp: float,
@@ -150,6 +194,9 @@ class MapStateRecorder:
             payload[sensor_id] = {
                 "state": sensor.current_state,
                 "last_changed": sensor.last_changed,
+                "available": sensor.is_available,
+                "reliable": sensor.is_reliable,
+                "stuck": sensor.is_stuck,
             }
         return payload
 

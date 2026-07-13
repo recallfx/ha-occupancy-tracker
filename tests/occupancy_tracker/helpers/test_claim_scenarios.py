@@ -592,8 +592,8 @@ def test_bootstrap_after_restart():
     assert _total_occupancy(areas) == 1
 
 
-def test_bootstrap_does_not_apply_to_isolated_area():
-    """Bootstrap does NOT fire for isolated areas with no adjacency (phantom rejection)."""
+def test_isolated_area_accepts_its_own_motion():
+    """An isolated area's sensor is valid evidence without adjacent areas."""
     now = time.time()
     config = {
         "areas": {"isolated": {"name": "Isolated"}},
@@ -607,11 +607,9 @@ def test_bootstrap_does_not_apply_to_isolated_area():
     sensors = {"s.i": SensorState("s.i", {"area": "isolated", "type": "motion"}, now)}
 
     _fire(resolver, sensors, areas, "s.i", True, now, detector)
-    assert areas["isolated"].occupancy == 0
+    assert areas["isolated"].occupancy == 1
 
-    warnings = detector.get_warnings()
-    assert len(warnings) == 1
-    assert warnings[0].type == "unexpected_motion"
+    assert detector.get_warnings() == []
 
 
 # ==================================================================

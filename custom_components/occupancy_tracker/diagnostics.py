@@ -73,6 +73,7 @@ class OccupancyDiagnostics:
                 "is_motion_sensor": sensor_type
                 in ["motion", "camera_motion", "camera_person"],
                 "current_state": sensor.current_state,
+                "is_available": sensor.is_available,
                 "area_id": area_id,
                 "area_exists": area_id in self.coordinator.areas if area_id else False,
                 "history_length": len(sensor.history)

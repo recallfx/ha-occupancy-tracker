@@ -40,6 +40,19 @@ def _set_occupancy(area, count):
         area.claims.add(f"_test_{i}")
 
 
+def test_unavailable_on_sensor_is_not_active_evidence():
+    """Last-known ON is ignored until the sensor becomes available again."""
+    now = time.time()
+    resolver = MapOccupancyResolver({"areas": {"room": {}}, "sensors": {}})
+    sensor = SensorState("s.room", {"area": "room", "type": "motion"}, now)
+    sensor.update_state(True, now + 1)
+    sensor.mark_unavailable(now + 2)
+    sensors = {sensor.id: sensor}
+
+    assert resolver._compute_sensor_active_areas(sensors) == set()
+    assert resolver._is_area_active("room", sensors) is False
+
+
 # ============================================================
 # Transfer-on-ON: basic claim transfer tests
 # ============================================================
@@ -237,8 +250,8 @@ def test_exit_capable_does_not_clear_if_indoor_neighbor_active():
 # ============================================================
 
 
-def test_phantom_rejection_no_source():
-    """Indoor non-exit area with no plausible source rejects motion."""
+def test_isolated_area_uses_own_sensor_as_source():
+    """An isolated area's own sensor is its only plausible source."""
     now = time.time()
     config = {
         "areas": {"isolated": {"name": "Isolated"}},
@@ -252,11 +265,9 @@ def test_phantom_rejection_no_source():
     sensors = {"s.i": SensorState("s.i", {"area": "isolated", "type": "motion"}, now)}
 
     _fire(resolver, sensors, areas, "s.i", True, now, detector)
-    assert areas["isolated"].occupancy == 0
+    assert areas["isolated"].occupancy == 1
 
-    warnings = detector.get_warnings()
-    assert len(warnings) == 1
-    assert warnings[0].type == "unexpected_motion"
+    assert detector.get_warnings() == []
 
 
 def test_phantom_not_rejected_with_recent_neighbor():

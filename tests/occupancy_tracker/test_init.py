@@ -5,12 +5,13 @@ from unittest.mock import patch
 import time
 
 from homeassistant.core import HomeAssistant, Event, State
-from homeassistant.const import STATE_ON
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 
 from custom_components.occupancy_tracker import (
     async_setup,
     DOMAIN,
 )
+from custom_components.occupancy_tracker.coordinator import OccupancyCoordinator
 
 
 @pytest.fixture
@@ -59,6 +60,119 @@ class TestAsyncSetup:
         assert len(coordinator.sensors) == 2
         assert "living_room" in coordinator.areas
         assert "kitchen" in coordinator.areas
+
+    async def test_setup_seeds_current_on_sensor_state(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """An already-active sensor must survive an integration restart."""
+        hass.states.async_set("binary_sensor.motion_living", STATE_ON)
+
+        await async_setup(hass, sample_config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        assert coordinator.sensors["binary_sensor.motion_living"].current_state is True
+        assert coordinator.get_occupancy("living_room") == 1
+
+    async def test_setup_seeds_current_on_multi_area_motion_sensor(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """An active multi-area sensor must seed every configured area safely."""
+        entity_id = "binary_sensor.motion_shared"
+        sample_config[DOMAIN]["sensors"] = {
+            entity_id: {
+                "area": ["living_room", "kitchen"],
+                "type": "motion",
+            }
+        }
+        hass.states.async_set(entity_id, STATE_ON)
+
+        await async_setup(hass, sample_config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        assert coordinator.sensors[entity_id].current_state is True
+        assert coordinator.areas["living_room"].last_motion > 0
+        assert coordinator.areas["kitchen"].last_motion > 0
+        assert sum(area.occupancy for area in coordinator.areas.values()) == 1
+
+    async def test_setup_orders_adjacent_active_sensors_by_config(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """The later configured active sensor must be the startup leader."""
+        hass.states.async_set("binary_sensor.motion_living", STATE_ON)
+        hass.states.async_set("binary_sensor.motion_kitchen", STATE_ON)
+
+        await async_setup(hass, sample_config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        startup_events = [
+            snapshot
+            for snapshot in coordinator.state_recorder.get_history()
+            if snapshot.event_type == "sensor"
+        ]
+        assert [snapshot.description for snapshot in startup_events] == [
+            "sensor:binary_sensor.motion_living:on",
+            "sensor:binary_sensor.motion_kitchen:on",
+        ]
+        assert startup_events[0].timestamp < startup_events[1].timestamp
+        assert coordinator.get_occupancy("living_room") == 0
+        assert coordinator.get_occupancy("kitchen") == 1
+
+    async def test_setup_seeds_current_on_sensor_in_isolated_area(
+        self, hass: HomeAssistant
+    ):
+        """A configured isolated area must accept its active startup sensor."""
+        entity_id = "binary_sensor.motion_isolated"
+        config = {
+            DOMAIN: {
+                "areas": {"isolated": {"name": "Isolated", "indoors": True}},
+                "adjacency": {},
+                "sensors": {
+                    entity_id: {"area": "isolated", "type": "motion"},
+                },
+            }
+        }
+        hass.states.async_set(entity_id, STATE_ON)
+
+        await async_setup(hass, config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        assert coordinator.sensors[entity_id].current_state is True
+        assert coordinator.get_occupancy("isolated") == 1
+
+    async def test_setup_does_not_replay_open_magnetic_sensor(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """An open door at startup is state, not a fresh door event."""
+        entity_id = "binary_sensor.living_room_door"
+        sample_config[DOMAIN]["sensors"][entity_id] = {
+            "area": "living_room",
+            "type": "door",
+        }
+        hass.states.async_set(entity_id, STATE_ON)
+
+        await async_setup(hass, sample_config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        assert coordinator.sensors[entity_id].current_state is True
+        assert coordinator.sensors[entity_id].is_available is True
+        assert coordinator.areas["living_room"].last_motion == 0
+        assert not any(
+            snapshot.event_type == "sensor"
+            for snapshot in coordinator.state_recorder.get_history()
+        )
+
+        hass.states.async_set(entity_id, STATE_OFF)
+        await hass.async_block_till_done()
+
+        assert coordinator.sensors[entity_id].current_state is False
+        sensor_history = [
+            snapshot
+            for snapshot in coordinator.state_recorder.get_history()
+            if snapshot.event_type == "sensor"
+        ]
+        assert len(sensor_history) == 1
+        assert sensor_history[0].description == f"sensor:{entity_id}:off"
+        assert coordinator.verify_history() is True
 
     async def test_setup_no_configuration(self, hass: HomeAssistant):
         """Test setup with no configuration."""
@@ -167,6 +281,125 @@ class TestStateChangeListener:
 
         # Process event from unknown sensor (should not raise error)
         coordinator.process_sensor_event("binary_sensor.unknown", True, time.time())
+
+    @pytest.mark.parametrize("invalid_state", [STATE_UNAVAILABLE, STATE_UNKNOWN])
+    @pytest.mark.parametrize(
+        ("recovery_state", "expected_active"),
+        [(STATE_OFF, False), (STATE_ON, True)],
+    )
+    async def test_invalid_sensor_state_is_not_trusted_as_active(
+        self,
+        hass: HomeAssistant,
+        sample_config,
+        invalid_state,
+        recovery_state,
+        expected_active,
+    ):
+        """Unavailable sensors must not remain trusted as active."""
+        await async_setup(hass, sample_config)
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        entity_id = "binary_sensor.motion_living"
+
+        hass.states.async_set(entity_id, STATE_ON)
+        await hass.async_block_till_done()
+        sensor = coordinator.sensors[entity_id]
+        assert sensor.current_state is True
+        last_changed = sensor.last_changed
+        activated_at = sensor.activated_at
+        sensor_history = list(sensor.history)
+        snapshot_count = len(coordinator.state_recorder.get_history())
+
+        hass.states.async_set(entity_id, invalid_state)
+        await hass.async_block_till_done()
+
+        assert sensor.current_state is True
+        assert sensor.activated_at == activated_at
+        assert sensor.is_available is False
+        assert sensor.is_reliable is True
+        assert sensor.is_trusted_active is False
+        assert sensor.last_changed == last_changed
+        assert sensor.history == sensor_history
+        assert coordinator.get_occupancy("living_room") == 1
+        snapshots = coordinator.state_recorder.get_history()
+        assert len(snapshots) == snapshot_count + 1
+        assert snapshots[-1].event_type == "availability"
+        assert snapshots[-1].description == (f"availability:{entity_id}:unavailable")
+
+        hass.states.async_set(entity_id, recovery_state)
+        await hass.async_block_till_done()
+
+        assert sensor.current_state is expected_active
+        assert sensor.is_available is True
+        assert sensor.is_reliable is True
+        if recovery_state == STATE_ON:
+            assert sensor.last_changed == last_changed
+        else:
+            assert sensor.last_changed > last_changed
+        assert coordinator.verify_history() is True
+
+    async def test_unavailable_sensor_keeps_history_replay_deterministic(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """Other sensor events during an outage must replay the same result."""
+        await async_setup(hass, sample_config)
+        coordinator = hass.data[DOMAIN]["coordinator"]
+
+        hass.states.async_set("binary_sensor.motion_living", STATE_ON)
+        await hass.async_block_till_done()
+        hass.states.async_set("binary_sensor.motion_living", STATE_UNAVAILABLE)
+        await hass.async_block_till_done()
+        hass.states.async_set("binary_sensor.motion_kitchen", STATE_ON)
+        await hass.async_block_till_done()
+
+        assert coordinator.verify_history() is True
+
+    async def test_repeated_on_from_stuck_sensor_does_not_refresh_evidence(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """An unreliable same-state ON is not a presence keep-alive."""
+        await async_setup(hass, sample_config)
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        entity_id = "binary_sensor.motion_living"
+
+        hass.states.async_set(entity_id, STATE_ON)
+        await hass.async_block_till_done()
+        sensor = coordinator.sensors[entity_id]
+        sensor.is_stuck = True
+        sensor.is_reliable = False
+        last_motion = coordinator.areas["living_room"].last_motion
+        snapshot_count = len(coordinator.state_recorder.get_history())
+
+        hass.states.async_set(entity_id, STATE_ON, {"heartbeat": 1})
+        await hass.async_block_till_done()
+
+        assert coordinator.areas["living_room"].last_motion == last_motion
+        assert len(coordinator.state_recorder.get_history()) == snapshot_count
+
+    def test_stuck_sensor_trust_state_replays_deterministically(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """A stuck transition must affect live and replayed rebuilds equally."""
+        coordinator = OccupancyCoordinator(
+            hass,
+            sample_config[DOMAIN],
+            enable_periodic_updates=False,
+        )
+        now = time.time()
+        old = now - 25 * 3600
+
+        coordinator.process_sensor_event(
+            "binary_sensor.motion_living", True, timestamp=old
+        )
+        coordinator.process_sensor_event(
+            "binary_sensor.motion_kitchen", True, timestamp=now
+        )
+        assert coordinator.sensors["binary_sensor.motion_living"].is_reliable is False
+
+        coordinator.process_sensor_event(
+            "binary_sensor.motion_kitchen", False, timestamp=now + 1
+        )
+
+        assert coordinator.verify_history() is True
 
 
 class TestIntegrationConfiguration:

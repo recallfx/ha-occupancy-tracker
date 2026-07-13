@@ -231,8 +231,8 @@ class TestAnomalyDetector:
         warnings = detector.get_warnings()
         assert len(warnings) == 1
 
-    def test_unexpected_activation_warns_when_no_adjacent_source(self):
-        """Unexpected motion in an empty non-exit area creates a warning."""
+    def test_isolated_area_motion_is_not_unexpected(self):
+        """An isolated area's own sensor is valid occupancy evidence."""
         timestamp = time.time()
         config = {
             "areas": {"back_hall": {"name": "Back Hall"}},
@@ -266,10 +266,8 @@ class TestAnomalyDetector:
         sensors["binary_sensor.back"].update_state(True, timestamp)
         resolver.process_snapshot(snapshot, areas, sensors, detector)
 
-        warnings = detector.get_warnings()
-        assert len(warnings) == 1
-        assert warnings[0].type == "unexpected_motion"
-        assert warnings[0].area == "back_hall"
+        assert areas["back_hall"].occupancy == 1
+        assert detector.get_warnings() == []
 
     def test_check_timeouts_recent_activity_no_warning(self):
         """Test that recent activity doesn't trigger warnings."""
@@ -479,6 +477,80 @@ class TestPhantomOccupancyCleanup:
         )
 
         assert areas["bedroom"].occupancy == 1
+
+    def test_not_cleared_own_sensor_on(self):
+        """Phantom cleanup skipped while the area's own sensor is active."""
+        config = self._make_config()
+        detector = AnomalyDetector(config)
+        areas = self._make_areas(config)
+        sensors = self._make_sensors(self.BASE_TIME)
+
+        _set_occupancy(areas["bedroom"], 1)
+        areas["bedroom"].last_motion = self.BASE_TIME - 12000
+        areas["hallway"].last_motion = self.BASE_TIME - 3600
+        sensors["sensor.bedroom_motion"].update_state(True, self.BASE_TIME - 10)
+
+        cleared_area_ids = detector.check_timeouts(
+            areas,
+            self.BASE_TIME,
+            sensors=sensors,
+            probability_fn=self._low_probability,
+        )
+
+        assert cleared_area_ids == []
+        assert areas["bedroom"].occupancy == 1
+        assert not any(
+            warning.type == "phantom_occupancy_cleared"
+            for warning in detector.get_warnings()
+        )
+
+    def test_unreliable_own_sensor_does_not_block_cleanup(self):
+        """An invalidated ON reading is not evidence of continued presence."""
+        config = self._make_config()
+        detector = AnomalyDetector(config)
+        areas = self._make_areas(config)
+        sensors = self._make_sensors(self.BASE_TIME)
+
+        _set_occupancy(areas["bedroom"], 1)
+        areas["bedroom"].last_motion = self.BASE_TIME - 12000
+        areas["hallway"].last_motion = self.BASE_TIME - 3600
+        sensor = sensors["sensor.bedroom_motion"]
+        sensor.current_state = True
+        sensor.is_reliable = False
+
+        cleared_area_ids = detector.check_timeouts(
+            areas,
+            self.BASE_TIME,
+            sensors=sensors,
+            probability_fn=self._low_probability,
+        )
+
+        assert cleared_area_ids == ["bedroom"]
+        assert areas["bedroom"].occupancy == 0
+
+    def test_unavailable_own_sensor_does_not_block_cleanup(self):
+        """A last-known ON state is ignored while its sensor is unavailable."""
+        config = self._make_config()
+        detector = AnomalyDetector(config)
+        areas = self._make_areas(config)
+        sensors = self._make_sensors(self.BASE_TIME)
+
+        _set_occupancy(areas["bedroom"], 1)
+        areas["bedroom"].last_motion = self.BASE_TIME - 12000
+        areas["hallway"].last_motion = self.BASE_TIME - 3600
+        sensor = sensors["sensor.bedroom_motion"]
+        sensor.update_state(True, self.BASE_TIME - 10)
+        sensor.mark_unavailable(self.BASE_TIME)
+
+        cleared_area_ids = detector.check_timeouts(
+            areas,
+            self.BASE_TIME,
+            sensors=sensors,
+            probability_fn=self._low_probability,
+        )
+
+        assert cleared_area_ids == ["bedroom"]
+        assert areas["bedroom"].occupancy == 0
 
     def test_not_cleared_recent_magnetic_event(self):
         """Phantom cleanup skipped when a door sensor on the area changed recently."""

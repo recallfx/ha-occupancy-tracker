@@ -241,6 +241,45 @@ class HistoryVerifier:
                     )
                 )
 
+            recorded_available = recorded_data.get("available", True)
+            if recorded_available != replayed_sensor.is_available:
+                self.differences.append(
+                    StateDifference(
+                        snapshot_index=index,
+                        timestamp=snapshot.timestamp,
+                        description="Sensor availability mismatch",
+                        sensor_id=sensor_id,
+                        recorded_value=recorded_available,
+                        replayed_value=replayed_sensor.is_available,
+                    )
+                )
+
+            recorded_reliable = recorded_data.get("reliable", True)
+            if recorded_reliable != replayed_sensor.is_reliable:
+                self.differences.append(
+                    StateDifference(
+                        snapshot_index=index,
+                        timestamp=snapshot.timestamp,
+                        description="Sensor reliability mismatch",
+                        sensor_id=sensor_id,
+                        recorded_value=recorded_reliable,
+                        replayed_value=replayed_sensor.is_reliable,
+                    )
+                )
+
+            recorded_stuck = recorded_data.get("stuck", False)
+            if recorded_stuck != replayed_sensor.is_stuck:
+                self.differences.append(
+                    StateDifference(
+                        snapshot_index=index,
+                        timestamp=snapshot.timestamp,
+                        description="Sensor stuck-state mismatch",
+                        sensor_id=sensor_id,
+                        recorded_value=recorded_stuck,
+                        replayed_value=replayed_sensor.is_stuck,
+                    )
+                )
+
     def get_differences(self) -> List[StateDifference]:
         """Get all detected differences."""
         return self.differences.copy()

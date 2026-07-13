@@ -169,9 +169,10 @@ class AnomalyDetector:
         Only clears when ALL conditions are true:
         1. Inactivity exceeds threshold (30 min)
         2. Probability has decayed below threshold (~170 min)
-        3. All neighboring areas are quiet (protects sleeping people)
-        4. No recent magnetic events (door/window)
-        5. Area is not exit-capable
+        3. The area's own motion sensors are inactive
+        4. All neighboring areas are quiet (protects sleeping people)
+        5. No recent magnetic events (door/window)
+        6. Area is not exit-capable
         """
         cleared_area_ids: List[str] = []
 
@@ -190,6 +191,16 @@ class AnomalyDetector:
             if probability >= self.phantom_probability_threshold:
                 continue
 
+            # Current sensor state is stronger evidence than probability decay.
+            own_sensor_active = any(
+                sensor.is_trusted_active
+                and sensor.config.get("type", "") in MOTION_SENSOR_TYPES
+                and area_id in sensor.area_ids
+                for sensor in sensors.values()
+            )
+            if own_sensor_active:
+                continue
+
             # Check ALL neighbors for recent activity
             any_neighbor_active = False
             for neighbor_id in self.adjacency_map.get(area_id, []):
@@ -202,7 +213,7 @@ class AnomalyDetector:
 
                 # Also check if any motion sensor in the neighbor is currently ON
                 for sensor in sensors.values():
-                    if not sensor.current_state:
+                    if not sensor.is_trusted_active:
                         continue
                     sensor_type = sensor.config.get("type", "")
                     if sensor_type not in MOTION_SENSOR_TYPES:

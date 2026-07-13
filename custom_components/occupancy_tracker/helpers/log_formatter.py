@@ -207,7 +207,7 @@ class LogFormatter:
 
     def _get_active_sensors(self) -> set:
         """Get set of currently active sensor IDs."""
-        return {sid for sid, s in self.sensors.items() if s.current_state}
+        return {sid for sid, s in self.sensors.items() if s.is_trusted_active}
 
     def _sensor_in_area(self, sensor_id: str, area_id: str) -> bool:
         """Check if sensor belongs to area."""
