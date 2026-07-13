@@ -916,6 +916,7 @@ class MapOccupancyResolver:
         timestamp: float,
     ) -> str:
         """Pick the occupied area within a cluster (most recent non-transition)."""
+
         def leader_key(area_id: str) -> tuple[float, int]:
             return (
                 areas[area_id].last_motion,
