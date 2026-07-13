@@ -73,6 +73,72 @@ class TestAsyncSetup:
         assert coordinator.sensors["binary_sensor.motion_living"].current_state is True
         assert coordinator.get_occupancy("living_room") == 1
 
+    async def test_setup_seeds_current_on_multi_area_motion_sensor(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """An active multi-area sensor must seed every configured area safely."""
+        entity_id = "binary_sensor.motion_shared"
+        sample_config[DOMAIN]["sensors"] = {
+            entity_id: {
+                "area": ["living_room", "kitchen"],
+                "type": "motion",
+            }
+        }
+        hass.states.async_set(entity_id, STATE_ON)
+
+        await async_setup(hass, sample_config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        assert coordinator.sensors[entity_id].current_state is True
+        assert coordinator.areas["living_room"].last_motion > 0
+        assert coordinator.areas["kitchen"].last_motion > 0
+        assert sum(area.occupancy for area in coordinator.areas.values()) == 1
+
+    async def test_setup_orders_adjacent_active_sensors_by_config(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """The later configured active sensor must be the startup leader."""
+        hass.states.async_set("binary_sensor.motion_living", STATE_ON)
+        hass.states.async_set("binary_sensor.motion_kitchen", STATE_ON)
+
+        await async_setup(hass, sample_config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        startup_events = [
+            snapshot
+            for snapshot in coordinator.state_recorder.get_history()
+            if snapshot.event_type == "sensor"
+        ]
+        assert [snapshot.description for snapshot in startup_events] == [
+            "sensor:binary_sensor.motion_living:on",
+            "sensor:binary_sensor.motion_kitchen:on",
+        ]
+        assert startup_events[0].timestamp < startup_events[1].timestamp
+        assert coordinator.get_occupancy("living_room") == 0
+        assert coordinator.get_occupancy("kitchen") == 1
+
+    async def test_setup_seeds_current_on_sensor_in_isolated_area(
+        self, hass: HomeAssistant
+    ):
+        """A configured isolated area must accept its active startup sensor."""
+        entity_id = "binary_sensor.motion_isolated"
+        config = {
+            DOMAIN: {
+                "areas": {"isolated": {"name": "Isolated", "indoors": True}},
+                "adjacency": {},
+                "sensors": {
+                    entity_id: {"area": "isolated", "type": "motion"},
+                },
+            }
+        }
+        hass.states.async_set(entity_id, STATE_ON)
+
+        await async_setup(hass, config)
+
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        assert coordinator.sensors[entity_id].current_state is True
+        assert coordinator.get_occupancy("isolated") == 1
+
     async def test_setup_does_not_replay_open_magnetic_sensor(
         self, hass: HomeAssistant, sample_config
     ):

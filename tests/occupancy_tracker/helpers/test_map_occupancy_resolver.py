@@ -250,8 +250,8 @@ def test_exit_capable_does_not_clear_if_indoor_neighbor_active():
 # ============================================================
 
 
-def test_phantom_rejection_no_source():
-    """Indoor non-exit area with no plausible source rejects motion."""
+def test_isolated_area_uses_own_sensor_as_source():
+    """An isolated area's own sensor is its only plausible source."""
     now = time.time()
     config = {
         "areas": {"isolated": {"name": "Isolated"}},
@@ -265,11 +265,9 @@ def test_phantom_rejection_no_source():
     sensors = {"s.i": SensorState("s.i", {"area": "isolated", "type": "motion"}, now)}
 
     _fire(resolver, sensors, areas, "s.i", True, now, detector)
-    assert areas["isolated"].occupancy == 0
+    assert areas["isolated"].occupancy == 1
 
-    warnings = detector.get_warnings()
-    assert len(warnings) == 1
-    assert warnings[0].type == "unexpected_motion"
+    assert detector.get_warnings() == []
 
 
 def test_phantom_not_rejected_with_recent_neighbor():

@@ -231,8 +231,8 @@ class TestAnomalyDetector:
         warnings = detector.get_warnings()
         assert len(warnings) == 1
 
-    def test_unexpected_activation_warns_when_no_adjacent_source(self):
-        """Unexpected motion in an empty non-exit area creates a warning."""
+    def test_isolated_area_motion_is_not_unexpected(self):
+        """An isolated area's own sensor is valid occupancy evidence."""
         timestamp = time.time()
         config = {
             "areas": {"back_hall": {"name": "Back Hall"}},
@@ -266,10 +266,8 @@ class TestAnomalyDetector:
         sensors["binary_sensor.back"].update_state(True, timestamp)
         resolver.process_snapshot(snapshot, areas, sensors, detector)
 
-        warnings = detector.get_warnings()
-        assert len(warnings) == 1
-        assert warnings[0].type == "unexpected_motion"
-        assert warnings[0].area == "back_hall"
+        assert areas["back_hall"].occupancy == 1
+        assert detector.get_warnings() == []
 
     def test_check_timeouts_recent_activity_no_warning(self):
         """Test that recent activity doesn't trigger warnings."""
