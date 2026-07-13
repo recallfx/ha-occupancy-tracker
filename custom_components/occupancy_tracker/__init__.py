@@ -217,8 +217,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         # Restore states already present when the integration starts. Motion ON
         # is live occupancy evidence; other states are only cached baselines.
-        timestamp = time.time()
-        for entity_id in sensor_entities:
+        startup_timestamp = time.time()
+        for index, entity_id in enumerate(sensor_entities):
+            timestamp = startup_timestamp + index * 0.000001
             state = hass.states.get(entity_id)
             sensor_type = occupancy_config["sensors"][entity_id].get("type", "")
             if state is None or state.state in ["unavailable", "unknown"]:
