@@ -291,7 +291,7 @@ def test_full_walk_chain():
     t_walk = now + 60.0
     _fire(resolver, sensors, areas, "s.corridor_1", True, t_walk)
     assert areas["corridor_1"].occupancy == 1
-    assert areas["study"].occupancy == 0
+    assert areas["study"].occupancy == 1
 
     # Entrance ON (+3.7s from corridor -- realistic adjacent walk)
     _fire(resolver, sensors, areas, "s.entrance", True, t_walk + 3.7)
@@ -299,7 +299,7 @@ def test_full_walk_chain():
     # Corridor_1 OFF (5s KNX delay)
     _fire(resolver, sensors, areas, "s.corridor_1", False, t_walk + 5.0)
     assert areas["entrance"].occupancy == 1
-    assert _total_occupancy(areas) == 1
+    assert areas["study"].occupancy == 1
 
     # Entrance OFF (5s KNX delay)
     _fire(resolver, sensors, areas, "s.entrance", False, t_walk + 8.7)
@@ -312,7 +312,8 @@ def test_full_walk_chain():
     # Dining ON (+0.8s from kitchen -- overlap)
     _fire(resolver, sensors, areas, "s.dining", True, t_walk + 32.5)
     # Open-plan rebalance moves claim to dining
-    assert _total_occupancy(areas) == 1
+    assert areas["study"].occupancy == 1
+    assert sum(areas[aid].occupancy for aid in ("kitchen", "dining_room", "living")) == 1
 
     # Person ends in the open-plan area
     open_plan_occ = (
@@ -650,10 +651,10 @@ def test_doorway_overlap_does_not_reverse_claim():
     # === Person starts walking out of bedroom_1 ===
     t = now + 60.0  # well past all activity windows
 
-    # Step 1: corridor_2 ON -> person walking out, displaces retained bedroom_1
+    # Step 1: corridor motion cannot prove the retained bedroom is empty.
     _fire(resolver, sensors, areas, "s.corridor_2", True, t)
     assert areas["corridor_2"].occupancy == 1
-    assert areas["bedroom_1"].occupancy == 0
+    assert areas["bedroom_1"].occupancy == 1
 
     # Step 2: corridor_1 ON -> person continues walking
     _fire(resolver, sensors, areas, "s.corridor_1", True, t + 2.0)
@@ -668,8 +669,9 @@ def test_doorway_overlap_does_not_reverse_claim():
     _fire(resolver, sensors, areas, "s.entrance", False, t + 10.5)
     assert areas["kitchen"].occupancy == 1
 
-    # Total: exactly 1 person, in kitchen
-    assert _total_occupancy(areas) == 1
+    # The destination is occupied without evicting the uncertain bedroom.
+    assert areas["bedroom_1"].occupancy == 1
+    assert areas["kitchen"].occupancy == 1
 
 
 def test_reverse_guard_does_not_block_legitimate_return():
@@ -700,7 +702,7 @@ def test_reverse_guard_does_not_block_legitimate_return():
     t = now + 60.0
     _fire(resolver, sensors, areas, "s.corridor_2", True, t)
     assert areas["corridor_2"].occupancy == 1
-    assert areas["bedroom_1"].occupancy == 0
+    assert areas["bedroom_1"].occupancy == 1
 
     # Wait 10 seconds (past RECENT_ACTIVATION_WINDOW = 5s)
     _fire(resolver, sensors, areas, "s.corridor_2", False, t + 5.0)
@@ -718,7 +720,7 @@ def test_reverse_guard_does_not_block_legitimate_return():
         resolver, sensors, areas, "s.bedroom_1", True, t + 135.0
     )  # 127s after corridor_2 last_motion (>120s)
     assert areas["bedroom_1"].occupancy == 1
-    assert _total_occupancy(areas) == 1
+    assert _total_occupancy(areas) == 2
 
 
 # ==================================================================
@@ -782,8 +784,8 @@ def test_bootstrap_expires_after_window():
 # ==================================================================
 
 
-def test_retained_room_clears_after_inactivity():
-    """Non-transition room clears after RETAINED_INACTIVITY_TIMEOUT (60s)."""
+def test_retained_room_clears_after_confirmed_departure_grace():
+    """A tightly coupled departure clears only after the 120-second grace."""
     now = time.time()
     config = _full_house_config()
     resolver = MapOccupancyResolver(config)
@@ -802,11 +804,15 @@ def test_retained_room_clears_after_inactivity():
     # bedroom_2 should be retained (person might still be there)
     # but study is now the main occupied area
 
-    # 65 seconds later, bedroom_2 still has no motion — should be cleared
-    # (house is active: study sensor keeps cycling)
+    # Before the grace expires, uncertainty is preserved.
     _fire(resolver, sensors, areas, "s.study", False, now + 72)
     _fire(resolver, sensors, areas, "s.study", True, now + 75)
-    # bedroom_2 last_motion was now+4, current time is now+75 → 71s > 60s
+    assert areas["bedroom_2"].occupancy == 1
+
+    # Bedroom motion at +4 followed by corridor at +10 is a coupled departure.
+    # A later event runs cleanup after more than 120 seconds.
+    _fire(resolver, sensors, areas, "s.study", False, now + 132)
+    _fire(resolver, sensors, areas, "s.study", True, now + 135)
     assert areas["bedroom_2"].occupancy == 0
     assert areas["study"].occupancy == 1
 
@@ -1102,8 +1108,8 @@ def test_sensor_off_gap_blocks_displacement():
 # ==================================================================
 
 
-def test_retention_cooldown_blocks_displacement():
-    """Room retained < 30s ago cannot be displaced even if guards are met."""
+def test_neighbor_motion_never_displaces_retained_room():
+    """A passer cannot displace a retained room before or after old guards."""
     now = time.time()
     config = _full_house_config()
     resolver = MapOccupancyResolver(config)
@@ -1125,10 +1131,10 @@ def test_retention_cooldown_blocks_displacement():
     _fire(resolver, sensors, areas, "s.corridor_1", True, now + 13)
     assert areas["study"].occupancy == 1, "Study displaced within retention cooldown!"
 
-    # 20 seconds after retention (past cooldown=10s and cycling guard=15s),
-    # corridor fires again. Now study CAN be displaced.
+    # Even after the old cooldown and cycling guard, neighbor motion alone
+    # is not proof that the room became empty.
     _fire(resolver, sensors, areas, "s.corridor_1", True, now + 30)
-    assert areas["study"].occupancy == 0, "Study should be displaced after cooldown"
+    assert areas["study"].occupancy == 1
 
 
 # ==================================================================
@@ -1191,10 +1197,8 @@ def test_still_person_sensor_stops_housemate_enters():
 # ==================================================================
 
 
-def test_still_person_recovers_on_sensor_refire():
-    """If displacement happens after guards expire (single-person,
-    no entry evidence), the room recovers immediately when the
-    sensor re-fires (person shifts in chair)."""
+def test_still_person_survives_neighbor_motion_and_refire():
+    """A still person remains occupied when a corridor sensor fires."""
     now = time.time()
     config = _full_house_config()
     resolver = MapOccupancyResolver(config)
@@ -1214,10 +1218,7 @@ def test_still_person_recovers_on_sensor_refire():
     # corridor fires (maybe a pet, draft, or single housemate)
     _fire(resolver, sensors, areas, "s.corridor_1", True, now + 45)
 
-    # With no exit-capable evidence, study is displaced (expected)
-    assert areas["study"].occupancy == 0, (
-        "Study should be displaced (no entry evidence)"
-    )
+    assert areas["study"].occupancy == 1
     assert areas["corridor_1"].occupancy == 1
 
     # Corridor sensor goes OFF, then person shifts — study sensor re-fires.
@@ -1235,9 +1236,8 @@ def test_still_person_recovers_on_sensor_refire():
 # ==================================================================
 
 
-def test_recently_occupied_room_reactivates_immediately():
-    """Room displaced, then sensor fires again. Must be immediately
-    occupied — no 10s delay waiting for persistent activation."""
+def test_retained_room_refire_remains_immediately_occupied():
+    """A retained room remains occupied and accepts its first sensor refire."""
     now = time.time()
     config = _full_house_config()
     resolver = MapOccupancyResolver(config)
@@ -1251,9 +1251,9 @@ def test_recently_occupied_room_reactivates_immediately():
     _fire(resolver, sensors, areas, "s.corridor_1", False, now + 7)
     _fire(resolver, sensors, areas, "s.study", False, now + 8)
 
-    # All guards expire, corridor fires → study displaced
+    # All old guards expire, but corridor motion does not evict the study.
     _fire(resolver, sensors, areas, "s.corridor_1", True, now + 45)
-    assert areas["study"].occupancy == 0, "Setup: study should be displaced"
+    assert areas["study"].occupancy == 1
 
     # Corridor goes OFF, all sensors quiet
     _fire(resolver, sensors, areas, "s.corridor_1", False, now + 50)
@@ -1265,3 +1265,31 @@ def test_recently_occupied_room_reactivates_immediately():
     assert areas["study"].occupancy == 1, (
         "Recently-occupied room not immediately re-activated!"
     )
+
+
+def test_four_rooms_and_outdoor_passer_do_not_evict_anyone():
+    """Room occupancy is uncapped and outdoor evidence cannot evict rooms."""
+    now = time.time()
+    config = _full_house_config()
+    resolver = MapOccupancyResolver(config)
+    areas, sensors = _full_house_areas_and_sensors(config, now)
+
+    room_sensors = (
+        ("study", "s.study"),
+        ("bedroom_1", "s.bedroom_1"),
+        ("bedroom_2", "s.bedroom_2"),
+        ("bathroom", "s.bathroom"),
+    )
+    for offset, (_, sensor_id) in enumerate(room_sensors):
+        _fire(resolver, sensors, areas, sensor_id, True, now + offset)
+
+    assert all(areas[area_id].occupied for area_id, _ in room_sensors)
+
+    for offset, (_, sensor_id) in enumerate(room_sensors, start=10):
+        _fire(resolver, sensors, areas, sensor_id, False, now + offset)
+
+    assert all(areas[area_id].occupied for area_id, _ in room_sensors)
+
+    _fire(resolver, sensors, areas, "s.frontyard", True, now + 30)
+    assert areas["frontyard"].occupied
+    assert all(areas[area_id].occupied for area_id, _ in room_sensors)

@@ -447,12 +447,12 @@ def test_1812_walk_study_to_kitchen():
 
     # -- The walk: study → corridor_1 → entrance → kitchen --
 
-    # Person gets up from study: corridor_1 ON (transfer from study)
+    # Corridor motion must not evict a potentially still-occupied study.
     _fire(
         resolver, sensors, areas, "binary_sensor.corridor_1_motion", True, t, detector
     )
     assert areas["corridor_1"].occupancy == 1
-    assert areas["study"].occupancy == 0
+    assert areas["study"].occupancy == 1
 
     # corridor_1 OFF after 5s KNX delay
     _fire(
@@ -812,8 +812,8 @@ def test_guest_room_first_motion_accepts_recent_entrance_path():
     )
 
     assert areas["guest_room"].occupancy == 1
-    assert _open_plan_occupancy(areas) == 0
-    assert _total_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) == 1
+    assert _total_occupancy(areas) >= 2
     assert not [
         warning
         for warning in detector.get_warnings()
@@ -1092,8 +1092,8 @@ def test_study_persistent_activation_accepted():
 
     # Study gets accepted via persistent activation but may be cleared
     # by the 2-minute inactivity cleanup between sparse triggers.
-    # The important invariant: total occupancy never exceeds max_occupants.
-    assert _total_occupancy(areas) <= 3
+    # Persistent valid activity must not be rejected by a global room cap.
+    assert areas["study"].occupancy == 1
 
 
 # ==================================================================
@@ -1311,8 +1311,6 @@ def test_full_production_sequence():
     assert areas["bedroom_1"].occupancy == 1, (
         f"Person not in bedroom_1. Occupied: {_occupied_areas(areas)}"
     )
-    # Open-plan should be empty
-    assert _open_plan_occupancy(areas) == 0, (
-        f"Open plan still occupied: K={areas['kitchen'].occupancy} "
-        f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
-    )
+    # The previous open-plan occupancy remains pessimistically retained until
+    # departure evidence and its grace period complete.
+    assert _open_plan_occupancy(areas) == 1

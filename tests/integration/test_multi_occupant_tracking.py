@@ -209,10 +209,11 @@ class TestHub:
         h.trigger_sensor("binary_sensor.motion_bedroom", False, delay=1)
         h.trigger_sensor("binary_sensor.motion_hall", True, delay=3)
         assert c.get_occupancy("hall") == 1
-        assert c.get_occupancy("bedroom") == 0
+        assert c.get_occupancy("bedroom") == 1
         h.trigger_sensor("binary_sensor.motion_kitchen", True, delay=1)
         assert c.get_occupancy("kitchen") == 1
         assert c.get_occupancy("hall") == 0
+        assert c.get_occupancy("bedroom") == 1
 
     async def test_two_people(self, hub: HomeAssistant):
         """Two people in hub - P2 enters when no adjacent occupied neighbor.
@@ -378,10 +379,9 @@ class TestThreeOccupants:
         assert c.get_occupancy("area_b") == 1
         assert c.get_occupancy("area_c") == 1
 
-        # P3 enters A - B is occupied, so transfer-on-ON steals from B
-        # Total = 2 (limitation: P3 can't create new claim with occupied B)
+        # P3 enters A. Pessimistic tracking preserves the two settled rooms.
         h.trigger_sensor("binary_sensor.motion_a", True, delay=5)
-        assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c"]) == 2
+        assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c"]) == 3
 
 
 @pytest.fixture
@@ -431,7 +431,7 @@ class TestMultiSensor:
         assert c.get_occupancy("room") == 1
         h.trigger_sensor("binary_sensor.entry_motion", True, delay=3)
         assert c.get_occupancy("entry") == 1
-        assert c.get_occupancy("room") == 0
+        assert c.get_occupancy("room") == 1
 
     async def test_camera_delayed(self, multi_sensor: HomeAssistant):
         c = multi_sensor.data[DOMAIN]["coordinator"]
@@ -540,10 +540,4 @@ class TestOpenPlan:
         h.trigger_sensor("binary_sensor.dining", False, delay=1)
         h.trigger_sensor("binary_sensor.corridor", True, delay=3)
         assert c.get_occupancy("corridor") == 1
-        assert (
-            sum(
-                c.get_occupancy(a)
-                for a in ["entry", "corridor", "kitchen", "dining", "living"]
-            )
-            == 1
-        )
+        assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) == 1

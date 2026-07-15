@@ -831,8 +831,8 @@ def test_magnetic_event_updates_last_motion():
 # ============================================================
 
 
-def test_full_walkthrough_entry_traverse_exit():
-    """Person enters, walks through house, and leaves."""
+def test_full_walkthrough_preserves_uncertain_room():
+    """A late neighboring activation does not erase retained occupancy."""
     now = time.time()
     config = {
         "areas": {
@@ -877,7 +877,7 @@ def test_full_walkthrough_entry_traverse_exit():
     # Walk back to hall
     _fire(resolver, sensors, areas, "s.h", True, now + 60)
     assert areas["hall"].occupancy == 1
-    assert areas["kitchen"].occupancy == 0
+    assert areas["kitchen"].occupancy == 1
 
     # Walk to entry
     _fire(resolver, sensors, areas, "s.e", True, now + 61)
@@ -889,6 +889,8 @@ def test_full_walkthrough_entry_traverse_exit():
     _fire(resolver, sensors, areas, "s.e", False, now + 66)
     assert areas["entry"].occupancy == 0
 
-    # Total: 0
+    # The exit clears, but the kitchen remains uncertain because its motion
+    # was not tightly coupled to the later hallway activation.
     total = sum(a.occupancy for a in areas.values())
-    assert total == 0
+    assert total == 1
+    assert areas["kitchen"].occupancy == 1
