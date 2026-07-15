@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .anomaly_detector import AnomalyDetector
@@ -16,62 +15,59 @@ _LOGGER = logging.getLogger("resolver")
 
 
 class MapOccupancyResolver:
-    """
-    Activity-clustering occupancy resolver (v3).
+    """Conservative occupancy resolver.
 
-    CORE PRINCIPLES:
-    1. Motion ON = someone is there. Update timestamp, rebuild clusters.
-    2. Motion OFF ≠ person left. Person stays until evidence shows they moved.
-    3. The LAST activated area in a chain of adjacent activations is where the person IS.
-    4. Separate clusters of simultaneous activity = separate people.
-    5. Open-plan areas with overlapping sensors form one detection zone.
-    6. Retained areas preserve occupancy for sleeping/sitting still.
+    Trusted positive evidence always wins. Indoor evidence is latched until an
+    explicit clear; adjacency is used only to explain suspicious activations.
     """
 
     # Timing constants
-    RECENT_MOTION_WINDOW = 60.0  # Area considered "recently active"
-    CLUSTER_MERGE_WINDOW = 10.0  # Max gap to merge adjacent activations into one chain
-    RETENTION_TIMEOUT = 28800.0  # 8 hours — max retention without motion
-    RETENTION_HOUSE_QUIET_GUARD = (
-        600.0  # 10 min — if house quiet this long, don't clear
-    )
-    EXIT_AREA_TIMEOUT = 300.0  # Exit-capable areas auto-clear after 5 min
+    PLAUSIBLE_SOURCE_WINDOW = 10.0
     OUTDOOR_INTRUSION_WINDOW = 300.0  # Magnetic evidence window
     BOOTSTRAP_WINDOW = 120.0  # After restart, allow any indoor activation for 2 min
-    RETAINED_INACTIVITY_TIMEOUT = 120.0  # Clear retained rooms after 2 min of no motion
     RECENTLY_OCCUPIED_WINDOW = (
         300.0  # Accept re-activation of rooms occupied within 5 min
-    )
-    SENSOR_CYCLING_GUARD = (
-        15.0  # Protect retained areas with recent motion (covers KNX 5s cycle)
-    )
-    MIN_RETENTION_COOLDOWN = (
-        10.0  # Minimum seconds before a retained area can be displaced/cleaned
-    )
-    DEPARTURE_COUPLING_WINDOW = (
-        15.0  # Neighbor motion must closely follow room motion to imply departure
     )
 
     def __init__(self, config: OccupancyTrackerConfig) -> None:
         self.adjacency_map = self._build_adjacency(config)
-        self._area_order = {
-            area_id: index for index, area_id in enumerate(config.get("areas", {}))
-        }
-        self.open_plan_groups: Dict[str, List[str]] = self._build_open_plan_groups(
-            config
-        )
-        self.area_to_group: Dict[str, str] = {}
-        for gid, members in self.open_plan_groups.items():
-            for aid in members:
-                self.area_to_group[aid] = gid
-        self.retained: Dict[str, float] = {}  # area_id -> retention start timestamp
+        self.indoor_latched: set[str] = set()
         self._first_activation_time: float = (
             0.0  # Timestamp of the very first sensor activation
         )
 
     def reset(self) -> None:
-        self.retained.clear()
+        self.indoor_latched.clear()
         self._first_activation_time = 0.0
+
+    def refresh_occupancy(
+        self,
+        timestamp: float,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> None:
+        """Recompute occupancy after sensor trust or availability changes."""
+        self._rebuild_occupancy(timestamp, areas, sensors)
+
+    def clear_stale_indoor_occupancy(
+        self,
+        timestamp: float,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> list[str]:
+        """Explicitly clear indoor latches without rejecting active sensors."""
+        active_areas = self._compute_sensor_active_areas(sensors)
+        cleared: list[str] = []
+
+        for area_id in sorted(self.indoor_latched):
+            if area_id in active_areas:
+                continue
+            self.indoor_latched.remove(area_id)
+            if area_id in areas:
+                areas[area_id].clear_occupancy(timestamp, reason="manual_clear")
+                cleared.append(area_id)
+
+        return cleared
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -90,17 +86,6 @@ class MapOccupancyResolver:
                 if area_id not in reverse_list:
                     reverse_list.append(area_id)
         return normalized
-
-    @staticmethod
-    def _build_open_plan_groups(config: OccupancyTrackerConfig) -> Dict[str, List[str]]:
-        groups = config.get("open_plan_groups", {}) if isinstance(config, dict) else {}
-        result: Dict[str, List[str]] = {}
-        for gid, gconfig in groups.items():
-            if isinstance(gconfig, dict):
-                result[gid] = gconfig.get("areas", [])
-            elif isinstance(gconfig, list):
-                result[gid] = gconfig
-        return result
 
     # ------------------------------------------------------------------
     # Sensor state queries
@@ -180,6 +165,24 @@ class MapOccupancyResolver:
         return parts[1], parts[2] == "on"
 
     @staticmethod
+    def _parse_clear_event(snapshot: MapSnapshot) -> list[str]:
+        if snapshot.event_type != "clear" or not snapshot.description:
+            return []
+        prefix, separator, area_list = snapshot.description.partition(":")
+        if prefix != "clear" or not separator:
+            return []
+        return [area_id for area_id in area_list.split(",") if area_id]
+
+    @staticmethod
+    def _parse_restore_event(snapshot: MapSnapshot) -> list[str]:
+        if snapshot.event_type != "restore" or not snapshot.description:
+            return []
+        prefix, separator, area_list = snapshot.description.partition(":")
+        if prefix != "restore" or not separator:
+            return []
+        return [area_id for area_id in area_list.split(",") if area_id]
+
+    @staticmethod
     def _restore_snapshot_sensor_metadata(
         snapshot: MapSnapshot,
         sensors: Dict[str, SensorState],
@@ -201,6 +204,37 @@ class MapOccupancyResolver:
         anomaly_detector: Optional[AnomalyDetector] = None,
     ) -> Optional[str]:
         """Apply a single snapshot event to update occupancy state."""
+        restored_area_ids = self._parse_restore_event(snapshot)
+        if restored_area_ids:
+            for area_id in restored_area_ids:
+                area = areas.get(area_id)
+                if not area or not area.is_indoors:
+                    continue
+                stored_area = snapshot.areas.get(area_id, {})
+                last_motion = stored_area.get("last_motion")
+                if isinstance(last_motion, (int, float)) and last_motion > 0:
+                    area.last_motion = float(last_motion)
+                stale_since = stored_area.get("stale_since")
+                area.stale_since = (
+                    float(stale_since)
+                    if isinstance(stale_since, (int, float)) and stale_since > 0
+                    else snapshot.timestamp
+                )
+                area.cleared_by = None
+                self.indoor_latched.add(area_id)
+                area.occupied = True
+            return None
+
+        cleared_area_ids = self._parse_clear_event(snapshot)
+        if cleared_area_ids:
+            for area_id in cleared_area_ids:
+                self.indoor_latched.discard(area_id)
+                if area_id in areas:
+                    areas[area_id].clear_occupancy(
+                        snapshot.timestamp, reason="manual_clear"
+                    )
+            return None
+
         event = self._parse_sensor_event(snapshot)
         if not event:
             return None
@@ -243,10 +277,9 @@ class MapOccupancyResolver:
         self.reset()
 
         for area in areas.values():
-            area.occupancy = 0
-            area.last_motion = 0
-            area.last_off = 0
-            area.activity_history = []
+            area.reset()
+        for sensor in sensors.values():
+            sensor.reset()
 
         for snapshot in history:
             baseline = self._parse_baseline_event(snapshot)
@@ -255,26 +288,26 @@ class MapOccupancyResolver:
                 sensor = sensors.get(sensor_id)
                 if sensor:
                     sensor.seed_state(state, snapshot.timestamp)
-                self._restore_snapshot_sensor_metadata(snapshot, sensors)
-                continue
-
-            availability = self._parse_availability_event(snapshot)
-            if availability:
+            elif availability := self._parse_availability_event(snapshot):
                 sensor_id, is_available = availability
                 sensor = sensors.get(sensor_id)
                 if sensor:
-                    sensor.is_available = is_available
-                self._restore_snapshot_sensor_metadata(snapshot, sensors)
-                continue
+                    if is_available:
+                        sensor.is_available = True
+                        sensor.last_update_time = snapshot.timestamp
+                    else:
+                        sensor.mark_unavailable(snapshot.timestamp)
+            else:
+                event = self._parse_sensor_event(snapshot)
+                if event:
+                    sensor_id, new_state = event
+                    sensor = sensors.get(sensor_id)
+                    if sensor:
+                        sensor.update_state(new_state, snapshot.timestamp)
+                self.process_snapshot(snapshot, areas, sensors, anomaly_detector)
 
-            event = self._parse_sensor_event(snapshot)
-            if event:
-                sensor_id, new_state = event
-                sensor = sensors.get(sensor_id)
-                if sensor:
-                    sensor.update_state(new_state, snapshot.timestamp)
-            self.process_snapshot(snapshot, areas, sensors, anomaly_detector)
             self._restore_snapshot_sensor_metadata(snapshot, sensors)
+            self.refresh_occupancy(snapshot.timestamp, areas, sensors)
 
     # ------------------------------------------------------------------
     # Magnetic events
@@ -291,7 +324,7 @@ class MapOccupancyResolver:
         for area_id in sensor.area_ids:
             area = areas.get(area_id)
             if area:
-                area.last_motion = timestamp
+                area.record_motion(timestamp)
                 _LOGGER.debug(f"Magnetic event on {sensor.id} kept {area_id} active")
         return None
 
@@ -307,24 +340,19 @@ class MapOccupancyResolver:
         sensors: Dict[str, SensorState],
         anomaly_detector: Optional[AnomalyDetector],
     ) -> Optional[str]:
-        """Handle motion sensor turning ON — update timestamp and rebuild clusters."""
+        """Handle motion sensor turning ON and rebuild occupancy."""
         area_ids = [area_id for area_id in sensor.area_ids if area_id in areas]
         if not area_ids:
             return None
 
         for area_id in area_ids:
-            areas[area_id].last_motion = timestamp
+            areas[area_id].record_motion(timestamp)
 
         # Track the very first activation for bootstrap window calculation
         if self._first_activation_time == 0.0:
             self._first_activation_time = timestamp
 
-        # If this area was retained, refresh retention timestamp
-        for area_id in area_ids:
-            if area_id in self.retained:
-                self.retained[area_id] = timestamp
-
-        # Rebuild clusters and set occupancy
+        # Rebuild current occupancy.
         self._rebuild_occupancy(timestamp, areas, sensors, anomaly_detector)
 
         return next((area_id for area_id in area_ids if areas[area_id].occupied), None)
@@ -340,13 +368,19 @@ class MapOccupancyResolver:
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
     ) -> Optional[str]:
-        """Handle motion sensor turning OFF — rebuild clusters if all sensors off."""
+        """Handle motion sensor turning OFF and rebuild occupancy."""
         area_ids = [area_id for area_id in sensor.area_ids if area_id in areas]
         if not area_ids:
             return None
 
         for area_id in area_ids:
             areas[area_id].last_off = timestamp
+            if (
+                area_id in self.indoor_latched
+                and not self._is_area_active(area_id, sensors)
+                and areas[area_id].stale_since is None
+            ):
+                areas[area_id].stale_since = timestamp
 
         # If other motion sensors in this area are still ON, skip rebuild
         if len(area_ids) == 1 and self._any_other_motion_sensor_active(
@@ -357,13 +391,13 @@ class MapOccupancyResolver:
             )
             return None
 
-        # Rebuild clusters
+        # Rebuild current occupancy.
         self._rebuild_occupancy(timestamp, areas, sensors)
 
         return None
 
     # ------------------------------------------------------------------
-    # Core: Cluster rebuild
+    # Core occupancy rebuild
     # ------------------------------------------------------------------
 
     def _rebuild_occupancy(
@@ -373,127 +407,49 @@ class MapOccupancyResolver:
         sensors: Dict[str, SensorState],
         anomaly_detector: Optional[AnomalyDetector] = None,
     ) -> None:
-        """Rebuild occupancy from scratch using activity clustering."""
+        """Combine live evidence with the conservative indoor latch."""
 
         # Pre-compute sensor-active areas once for the entire rebuild.
         # This avoids O(sensors) iteration on every _is_area_active call.
         sensor_active_areas = self._compute_sensor_active_areas(sensors)
 
-        # =============================================
-        # PHASE 0: Clean stale retentions BEFORE building active areas
-        # =============================================
-        self._clean_retained(timestamp, areas, sensor_active_areas)
+        # Indoor occupancy is a conservative latch. Once established, silence
+        # and movement elsewhere are not proof that the room is empty.
+        self.indoor_latched.update(
+            area_id
+            for area_id in sensor_active_areas
+            if area_id in areas and areas[area_id].is_indoors
+        )
 
-        # =============================================
-        # PHASE 1: Identify active areas
-        # =============================================
-        active_areas = self._build_active_areas(
+        self._report_unexpected_active_areas(
             timestamp, areas, sensors, anomaly_detector
         )
 
-        # =============================================
-        # PHASE 2: Build adjacency clusters
-        # =============================================
-        clusters = self._build_clusters(active_areas, areas, timestamp)
+        final_occupied = sensor_active_areas | self.indoor_latched
 
-        # =============================================
-        # PHASE 2b: Force-merge open-plan groups
-        # =============================================
-        clusters = self._merge_open_plan(clusters)
-
-        # =============================================
-        # PHASE 3: Determine occupied area per cluster
-        # =============================================
-        occupied_areas = set()
-        for cluster in clusters:
-            if not cluster:
-                continue
-            leader = self._pick_leader(cluster, areas, timestamp)
-            occupied_areas.add(leader)
-
-        # =============================================
-        # PHASE 5: Manage retention
-        # =============================================
-        previously_occupied = {aid for aid, a in areas.items() if a.occupied}
-
-        # Build set of areas that are in the same cluster as an occupied leader
-        # These are "trail" areas — person walked through, not staying
-        trail_areas: set[str] = set()
-        for cluster in clusters:
-            leader_in_cluster = cluster & occupied_areas
-            if leader_in_cluster:
-                trail_areas |= cluster - leader_in_cluster
-
-        # Areas that lost occupancy — start retention
-        for area_id in previously_occupied - occupied_areas:
-            area = areas[area_id]
-            if area.is_exit_capable:
-                continue
-            if area.is_transition:
-                continue
-            if area_id in trail_areas:
-                continue
-            grp = self.area_to_group.get(area_id)
-            if grp is not None:
-                group_has_leader = any(
-                    self.area_to_group.get(occ) == grp for occ in occupied_areas
-                )
-                if group_has_leader:
-                    continue
-            # Don't retain if the area has been inactive for too long AND
-            # a neighbor has more recent motion (evidence the person left).
-            # This prevents re-retaining areas that Phase 0 just cleaned.
-            if (
-                area.last_motion > 0
-                and (timestamp - area.last_motion) > self.RETAINED_INACTIVITY_TIMEOUT
-                and self._has_leaving_evidence(area_id, areas)
-            ):
-                continue
-            self.retained[area_id] = timestamp
-
-        # Remove from retained when area is a trail area (in someone else's
-        # cluster, not the leader).  Do NOT remove just because the sensor
-        # came ON — the retained flag protects against merging with a
-        # different person's walking cluster.
-        for area_id in list(self.retained.keys()):
-            if area_id in trail_areas:
-                del self.retained[area_id]
-
-        # =============================================
-        # PHASE 6: Final occupancy including retained
-        # =============================================
-        final_occupied = occupied_areas | set(self.retained.keys())
-
-        # =============================================
-        # PHASE 7: Apply to area state
-        # =============================================
         for area_id, area in areas.items():
             area.occupied = area_id in final_occupied
-            area.cluster_id = None
-            for i, cluster in enumerate(clusters):
-                if area_id in cluster:
-                    area.cluster_id = i
-                    break
 
         if _LOGGER.isEnabledFor(logging.DEBUG):
             occ = {aid for aid, a in areas.items() if a.occupied}
             _LOGGER.debug(
-                f"Rebuild @ {timestamp:.1f}: occupied={occ}, retained={set(self.retained.keys())}"
+                "Rebuild @ %.1f: occupied=%s, latched=%s",
+                timestamp,
+                occ,
+                self.indoor_latched,
             )
 
     # ------------------------------------------------------------------
-    # Phase 1: Build active areas with phantom rejection
+    # Positive-evidence diagnostics
     # ------------------------------------------------------------------
 
-    def _build_active_areas(
+    def _report_unexpected_active_areas(
         self,
         timestamp: float,
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
         anomaly_detector: Optional[AnomalyDetector] = None,
-    ) -> set[str]:
-        active_areas: set[str] = set()
-
+    ) -> None:
         for area_id, area in areas.items():
             is_sensor_on = self._is_area_active(area_id, sensors)
 
@@ -505,15 +461,6 @@ class MapOccupancyResolver:
                     anomaly_detector.record_unexpected_activation(
                         area_id, None, timestamp, context="no_plausible_source"
                     )
-                continue
-
-            active_areas.add(area_id)
-
-        # Add retained areas
-        for area_id in self.retained:
-            active_areas.add(area_id)
-
-        return active_areas
 
     def _has_plausible_source(
         self,
@@ -532,8 +479,8 @@ class MapOccupancyResolver:
         if not self.adjacency_map.get(area_id):
             return True
 
-        # Already occupied or retained
-        if area.occupied or area_id in self.retained:
+        # Already occupied.
+        if area.occupied:
             return True
 
         # Recently occupied: if this area was occupied within 5 minutes,
@@ -556,7 +503,7 @@ class MapOccupancyResolver:
 
             if (
                 neighbor.last_motion > 0
-                and (timestamp - neighbor.last_motion) <= self.CLUSTER_MERGE_WINDOW
+                and (timestamp - neighbor.last_motion) <= self.PLAUSIBLE_SOURCE_WINDOW
             ):
                 return True
 
@@ -568,9 +515,6 @@ class MapOccupancyResolver:
                 and (timestamp - neighbor.last_occupied_at)
                 <= self.RECENTLY_OCCUPIED_WINDOW
             ):
-                return True
-
-            if neighbor_id in self.retained:
                 return True
 
         # Check magnetic evidence
@@ -621,215 +565,3 @@ class MapOccupancyResolver:
                 return True
 
         return False
-
-    # ------------------------------------------------------------------
-    # Phase 2: Build clusters via BFS
-    # ------------------------------------------------------------------
-
-    def _build_clusters(
-        self,
-        active_areas: set[str],
-        areas: Dict[str, AreaState],
-        timestamp: float,
-    ) -> list[set[str]]:
-        clusters: list[set[str]] = []
-        visited: set[str] = set()
-
-        for area_id in active_areas:
-            if area_id in visited:
-                continue
-            cluster: set[str] = set()
-            queue = deque([area_id])
-            while queue:
-                current = queue.popleft()
-                if current in visited:
-                    continue
-                visited.add(current)
-                cluster.add(current)
-
-                for neighbor_id in self.adjacency_map.get(current, []):
-                    if neighbor_id in visited:
-                        continue
-                    if neighbor_id not in active_areas:
-                        continue
-                    if self._should_merge(current, neighbor_id, areas, timestamp):
-                        queue.append(neighbor_id)
-
-            clusters.append(cluster)
-
-        return clusters
-
-    def _should_merge(
-        self,
-        area_a: str,
-        area_b: str,
-        areas: Dict[str, AreaState],
-        timestamp: float,
-    ) -> bool:
-        """Determine if two adjacent active areas should be in the same cluster."""
-        # Open-plan areas always merge
-        grp_a = self.area_to_group.get(area_a)
-        grp_b = self.area_to_group.get(area_b)
-        if grp_a is not None and grp_a == grp_b:
-            return True
-
-        # If either is retained, don't merge — a retained area represents
-        # a person sitting still and should not be absorbed into a different
-        # person's walking cluster.
-        if area_a in self.retained or area_b in self.retained:
-            return False
-
-        a = areas[area_a]
-        b = areas[area_b]
-        time_gap = abs(a.last_motion - b.last_motion)
-
-        return time_gap <= self.CLUSTER_MERGE_WINDOW
-
-    # ------------------------------------------------------------------
-    # Phase 2b: Force-merge open-plan groups
-    # ------------------------------------------------------------------
-
-    def _merge_open_plan(self, clusters: list[set[str]]) -> list[set[str]]:
-        for group_id, group_members in self.open_plan_groups.items():
-            group_cluster_indices: set[int] = set()
-            for i, cluster in enumerate(clusters):
-                for member in group_members:
-                    if member in cluster:
-                        group_cluster_indices.add(i)
-                        break
-
-            if len(group_cluster_indices) > 1:
-                merged: set[str] = set()
-                for i in group_cluster_indices:
-                    merged |= clusters[i]
-                for i in sorted(group_cluster_indices, reverse=True):
-                    clusters.pop(i)
-                clusters.append(merged)
-
-        return clusters
-
-    # ------------------------------------------------------------------
-    # Phase 3: Pick leader per cluster
-    # ------------------------------------------------------------------
-
-    def _pick_leader(
-        self,
-        cluster: set[str],
-        areas: Dict[str, AreaState],
-        timestamp: float,
-    ) -> str:
-        """Pick the occupied area within a cluster (most recent non-transition)."""
-
-        def leader_key(area_id: str) -> tuple[float, int]:
-            return (
-                areas[area_id].last_motion,
-                -self._area_order.get(area_id, len(self._area_order)),
-            )
-
-        # Prefer non-transition areas with very recent motion
-        non_transition = [
-            aid
-            for aid in cluster
-            if not areas[aid].is_transition
-            and (timestamp - areas[aid].last_motion) <= self.CLUSTER_MERGE_WINDOW
-        ]
-        if non_transition:
-            return max(non_transition, key=leader_key)
-
-        # Fall back to any non-transition area
-        non_transition_all = [aid for aid in cluster if not areas[aid].is_transition]
-        if non_transition_all:
-            return max(non_transition_all, key=leader_key)
-
-        # All transition — pick most recent
-        return max(cluster, key=leader_key)
-
-    # ------------------------------------------------------------------
-    # Shared helpers
-    # ------------------------------------------------------------------
-
-    def _has_leaving_evidence(self, area_id: str, areas: Dict[str, AreaState]) -> bool:
-        """Check for tightly coupled room-to-neighbor motion."""
-        area = areas[area_id]
-        for neighbor_id in self.adjacency_map.get(area_id, []):
-            neighbor = areas.get(neighbor_id)
-            if not neighbor or neighbor.last_motion <= area.last_motion:
-                continue
-            if (
-                neighbor.last_motion - area.last_motion
-                <= self.DEPARTURE_COUPLING_WINDOW
-            ):
-                return True
-        return False
-
-    # ------------------------------------------------------------------
-    # Phase 5: Clean retained
-    # ------------------------------------------------------------------
-
-    def _clean_retained(
-        self,
-        timestamp: float,
-        areas: Dict[str, AreaState],
-        sensor_active_areas: set[str],
-    ) -> None:
-        """Remove retained areas that should no longer be occupied.
-
-        Args:
-            sensor_active_areas: Pre-computed set of area IDs with active sensors.
-        """
-        # Check if the entire house is quiet
-        house_quiet = all(
-            area_id not in sensor_active_areas
-            and (
-                area.last_motion == 0
-                or (timestamp - area.last_motion) > self.RETENTION_HOUSE_QUIET_GUARD
-            )
-            for area_id, area in areas.items()
-        )
-
-        stale = []
-        for area_id, retention_start in self.retained.items():
-            area = areas[area_id]
-
-            # Absolute timeout
-            if (timestamp - retention_start) > self.RETENTION_TIMEOUT:
-                stale.append(area_id)
-                continue
-
-            # Exit-capable shorter timeout
-            if area.is_exit_capable:
-                if (timestamp - area.last_motion) > self.EXIT_AREA_TIMEOUT:
-                    stale.append(area_id)
-                    continue
-
-            # If house is quiet, don't clear anyone (people sleeping)
-            if house_quiet:
-                continue
-
-            # Retention cooldown: don't clean areas that were only recently
-            # retained — give the sensor time to re-detect the person.
-            if (timestamp - retention_start) < self.MIN_RETENTION_COOLDOWN:
-                continue
-
-            # Sensor cycling guard: if area had motion very recently, the
-            # sensor is likely just in its OFF gap.
-            if (
-                area.last_motion > 0
-                and (timestamp - area.last_motion) <= self.SENSOR_CYCLING_GUARD
-            ):
-                continue
-
-            # Inactivity cleanup: only clear if BOTH conditions are met:
-            # 1. No motion in this area for RETAINED_INACTIVITY_TIMEOUT (120s)
-            # 2. An adjacent area has motion MORE RECENT than this area's
-            #    last_motion — evidence the person walked out.
-            if (
-                area.last_motion > 0
-                and (timestamp - area.last_motion) > self.RETAINED_INACTIVITY_TIMEOUT
-                and self._has_leaving_evidence(area_id, areas)
-            ):
-                stale.append(area_id)
-                continue
-
-        for area_id in stale:
-            del self.retained[area_id]

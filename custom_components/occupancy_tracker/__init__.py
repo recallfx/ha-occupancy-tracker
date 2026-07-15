@@ -121,7 +121,8 @@ AREA_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
-# Schema for open-plan group configuration
+# Deprecated compatibility schema. The conservative resolver no longer groups
+# areas; keeping this accepted avoids breaking existing YAML.
 OPEN_PLAN_GROUP_SCHEMA = vol.Schema(
     {
         vol.Required("areas"): vol.All([cv.string]),
@@ -159,7 +160,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         "areas": conf.get("areas", {}),
         "adjacency": conf.get("adjacency", {}),
         "sensors": conf.get("sensors", {}),
-        "open_plan_groups": conf.get("open_plan_groups", {}),
     }
 
     # Set up dedicated log file
@@ -174,6 +174,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # Create the coordinator instance.
     coordinator = OccupancyCoordinator(hass, occupancy_config)
+    await coordinator.async_restore_occupancy()
 
     # Store the coordinator
     hass.data[DOMAIN] = {"coordinator": coordinator}
@@ -233,9 +234,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     timestamp,
                 )
 
-    # Set up periodic check for timeouts (every 60 seconds)
-    # Note: The coordinator also has a 5-second update_interval for consistency checks.
-    # This 60-second check is specifically for longer-term anomalies.
+    # Run the single periodic diagnostics check every 60 seconds.
     async def interval_listener(now) -> None:
         """Handle periodic checks."""
         coordinator.check_timeouts(timestamp=now.timestamp())

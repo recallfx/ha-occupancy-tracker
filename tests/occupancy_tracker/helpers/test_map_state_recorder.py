@@ -49,6 +49,28 @@ def test_record_sensor_event_snapshot_includes_state():
     assert snapshot.sensors["binary_sensor.motion_living_room"]["state"] is False
 
 
+def test_record_clear_event_is_replayable():
+    """Explicit occupancy cleanup must be represented in event history."""
+    base_time, areas, sensors = _build_state_fixture()
+    recorder = MapStateRecorder()
+
+    snapshot = recorder.record_clear_event(base_time, ["living_room"], areas, sensors)
+
+    assert snapshot.event_type == "clear"
+    assert snapshot.description == "clear:living_room"
+
+
+def test_record_restore_event_is_replayable():
+    """Persistent occupancy restoration must be represented in event history."""
+    base_time, areas, sensors = _build_state_fixture()
+    recorder = MapStateRecorder()
+
+    snapshot = recorder.record_restore_event(base_time, ["living_room"], areas, sensors)
+
+    assert snapshot.event_type == "restore"
+    assert snapshot.description == "restore:living_room"
+
+
 def test_tick_snapshots_respect_interval():
     """Tick snapshots should be skipped until the configured interval expires."""
     base_time, areas, sensors = _build_state_fixture()

@@ -37,9 +37,14 @@ def coordinator():
             "porch": {"name": "Porch", "indoors": False},
         },
         "adjacency": {},
-        "sensors": {},
+        "sensors": {
+            "binary_sensor.living_room_motion": {
+                "area": "living_room",
+                "type": "motion",
+            }
+        },
     }
-    return OccupancyCoordinator(hass, config)
+    return OccupancyCoordinator(hass, config, store=Mock())
 
 
 class TestAreaOccupancyBinarySensor:
@@ -77,14 +82,46 @@ class TestAreaOccupancyBinarySensor:
         assert attrs["occupancy_count"] == 1
 
     def test_attributes_include_probability(self, coordinator):
-        """Test attributes include probability."""
+        """Test attributes expose freshness with a compatibility alias."""
         _set_occupancy(coordinator.areas["living_room"], 1)
         coordinator.areas["living_room"].record_motion(time.time())
 
         sensor = AreaOccupancyBinarySensor(coordinator, "living_room")
         attrs = sensor.extra_state_attributes
 
+        assert attrs["freshness"] == 1.0
         assert attrs["probability"] == 1.0
+
+    def test_attributes_explain_occupancy_evidence(self, coordinator):
+        """Area attributes distinguish live evidence from a stale latch."""
+        area = coordinator.areas["living_room"]
+        sensor_state = coordinator.sensors["binary_sensor.living_room_motion"]
+        sensor = AreaOccupancyBinarySensor(coordinator, "living_room")
+
+        area.occupied = True
+        area.record_motion(1000.0)
+        sensor_state.current_state = True
+        assert sensor.extra_state_attributes["evidence_state"] == "active"
+        assert sensor.extra_state_attributes["active_sensors"] == [
+            "binary_sensor.living_room_motion"
+        ]
+
+        sensor_state.current_state = False
+        area.stale_since = 1010.0
+        coordinator.occupancy_resolver.indoor_latched.add("living_room")
+        attrs = sensor.extra_state_attributes
+        assert attrs["evidence_state"] == "stale"
+        assert attrs["last_positive_evidence"] == 1000.0
+        assert attrs["stale_since"] == 1010.0
+
+    def test_attributes_explain_inferred_and_vacant_states(self, coordinator):
+        """Non-latched occupancy remains visibly distinct from vacancy."""
+        sensor = AreaOccupancyBinarySensor(coordinator, "porch")
+
+        assert sensor.extra_state_attributes["evidence_state"] == "vacant"
+
+        coordinator.areas["porch"].occupied = True
+        assert sensor.extra_state_attributes["evidence_state"] == "inferred"
 
     def test_attributes_include_area_properties(self, coordinator):
         """Test attributes include indoors and exit_capable."""

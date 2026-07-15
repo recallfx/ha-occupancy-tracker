@@ -1,4 +1,4 @@
-"""Tests for claim-based occupancy tracking."""
+"""Integration tests for conservative occupancy tracking."""
 
 from __future__ import annotations
 import pytest
@@ -49,7 +49,7 @@ class TestSingleOccupant:
         h.trigger_sensor("binary_sensor.motion_a", True)
         assert c.get_occupancy("area_a") == 1
         h.trigger_sensor("binary_sensor.motion_a", False)
-        assert c.get_occupancy("area_a") == 0
+        assert c.get_occupancy("area_a") == 1
 
     async def test_simple_movement(self, linear: HomeAssistant):
         c = linear.data[DOMAIN]["coordinator"]
@@ -57,7 +57,7 @@ class TestSingleOccupant:
         h.trigger_sensor("binary_sensor.motion_a", True)
         assert c.get_occupancy("area_a") == 1
         h.trigger_sensor("binary_sensor.motion_b", True, delay=0.5)
-        assert c.get_occupancy("area_a") == 0
+        assert c.get_occupancy("area_a") == 1
         assert c.get_occupancy("area_b") == 1
 
     async def test_chain_movement(self, linear: HomeAssistant):
@@ -69,8 +69,8 @@ class TestSingleOccupant:
         h.trigger_sensor("binary_sensor.motion_c", True, delay=0.5)
         h.trigger_sensor("binary_sensor.motion_b", False, delay=0.5)
         h.trigger_sensor("binary_sensor.motion_c", False)
-        assert c.get_occupancy("area_a") == 0
-        assert c.get_occupancy("area_b") == 0
+        assert c.get_occupancy("area_a") == 1
+        assert c.get_occupancy("area_b") == 1
         assert c.get_occupancy("area_c") == 1
 
     async def test_person_stays(self, linear: HomeAssistant):
@@ -102,7 +102,7 @@ class TestMultiOccupant:
         assert c.get_occupancy("area_c") == 1
         h.trigger_sensor("binary_sensor.motion_a", True, delay=5)
         assert c.get_occupancy("area_a") == 1
-        assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c"]) == 2
+        assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c"]) >= 2
 
     async def test_two_people_different_rooms(self, linear: HomeAssistant):
         c = linear.data[DOMAIN]["coordinator"]
@@ -118,7 +118,7 @@ class TestMultiOccupant:
         h.trigger_sensor("binary_sensor.motion_a", False, delay=1)
         assert c.get_occupancy("area_b") == 1
         assert c.get_occupancy("area_c") == 1
-        assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c"]) == 2
+        assert sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c"]) >= 2
 
 
 class TestEdgeCases:
@@ -127,7 +127,7 @@ class TestEdgeCases:
         h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_b", True, delay=0.5)
-        assert c.get_occupancy("area_a") == 0
+        assert c.get_occupancy("area_a") == 1
         assert c.get_occupancy("area_b") == 1
 
     async def test_exit_reenter(self, linear: HomeAssistant):
@@ -135,7 +135,7 @@ class TestEdgeCases:
         h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_a", True)
         h.trigger_sensor("binary_sensor.motion_a", False, delay=5)
-        assert c.get_occupancy("area_a") == 0
+        assert c.get_occupancy("area_a") == 1
         h.trigger_sensor("binary_sensor.motion_a", True, delay=10)
         assert c.get_occupancy("area_a") == 1
 
@@ -160,7 +160,7 @@ class TestEdgeCases:
         # Now ~124s past first activation — bootstrap expired
         # Phantom trigger in C: only neighbor is B (empty, no activity)
         h.trigger_sensor("binary_sensor.motion_c", True, delay=5)
-        assert c.get_occupancy("area_c") == 0
+        assert c.get_occupancy("area_c") == 1
         assert c.get_occupancy("area_a") == 1
 
 
@@ -197,7 +197,7 @@ class TestHub:
         h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.motion_hall", True)
         h.trigger_sensor("binary_sensor.motion_kitchen", True, delay=1)
-        assert c.get_occupancy("hall") == 0
+        assert c.get_occupancy("hall") == 1
         assert c.get_occupancy("kitchen") == 1
 
     async def test_bedroom_to_kitchen(self, hub: HomeAssistant):
@@ -212,7 +212,7 @@ class TestHub:
         assert c.get_occupancy("bedroom") == 1
         h.trigger_sensor("binary_sensor.motion_kitchen", True, delay=1)
         assert c.get_occupancy("kitchen") == 1
-        assert c.get_occupancy("hall") == 0
+        assert c.get_occupancy("hall") == 1
         assert c.get_occupancy("bedroom") == 1
 
     async def test_two_people(self, hub: HomeAssistant):
@@ -230,20 +230,20 @@ class TestHub:
         h.trigger_sensor("binary_sensor.motion_hall", True)
         h.trigger_sensor("binary_sensor.motion_kitchen", True, delay=1)
         assert c.get_occupancy("kitchen") == 1
-        assert c.get_occupancy("hall") == 0
+        assert c.get_occupancy("hall") == 1
         h.trigger_sensor("binary_sensor.motion_hall", False, delay=3)
-        # P2 enters hall - transfers P1's claim from kitchen (known limitation)
+        # P2 enters hall without clearing the uncertain kitchen.
         h.trigger_sensor("binary_sensor.motion_hall", True, delay=5)
         assert c.get_occupancy("hall") == 1
-        assert c.get_occupancy("kitchen") == 0
-        # P2 goes to bedroom - transfers the claim
+        assert c.get_occupancy("kitchen") == 1
+        # P2 goes to bedroom; all positive indoor evidence stays latched.
         h.trigger_sensor("binary_sensor.motion_bedroom", True, delay=1)
         assert c.get_occupancy("bedroom") == 1
-        assert c.get_occupancy("hall") == 0
-        # Total occupancy is 1 (limitation: can't create second claim through hub)
+        assert c.get_occupancy("hall") == 1
+        # At least one occupied area remains visible throughout the path.
         assert (
             sum(c.get_occupancy(a) for a in ["hall", "kitchen", "bedroom", "bathroom"])
-            == 1
+            >= 1
         )
 
 
@@ -290,7 +290,7 @@ class TestLoop:
         assert c.get_occupancy("area_c") == 1
         assert (
             sum(c.get_occupancy(a) for a in ["area_a", "area_b", "area_c", "area_d"])
-            == 1
+            >= 1
         )
 
 
@@ -444,16 +444,20 @@ class TestMultiSensor:
 
 
 class TestPhantomCleanup:
-    async def test_phantom_cleared(self, linear: HomeAssistant):
+    async def test_phantom_warned_but_not_cleared(self, linear: HomeAssistant):
         c = linear.data[DOMAIN]["coordinator"]
         h = SensorEventHelper(c)
         _set_occ(c.areas["area_c"], 1)
         c.areas["area_c"].last_motion = h.current_time - 12000
         c.areas["area_b"].last_motion = h.current_time - 3600
         c.anomaly_detector.check_timeouts(
-            c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 0.12
+            c.areas, h.current_time, sensors=c.sensors, freshness_fn=lambda a, t: 0.12
         )
-        assert c.get_occupancy("area_c") == 0
+        assert c.get_occupancy("area_c") == 1
+        assert any(
+            warning.type == "phantom_occupancy_suspected"
+            for warning in c.anomaly_detector.get_warnings()
+        )
 
     async def test_not_cleared_neighbor(self, linear: HomeAssistant):
         c = linear.data[DOMAIN]["coordinator"]
@@ -462,7 +466,7 @@ class TestPhantomCleanup:
         c.areas["area_c"].last_motion = h.current_time - 12000
         c.areas["area_b"].last_motion = h.current_time - 60
         c.anomaly_detector.check_timeouts(
-            c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 0.12
+            c.areas, h.current_time, sensors=c.sensors, freshness_fn=lambda a, t: 0.12
         )
         assert c.get_occupancy("area_c") == 1
 
@@ -472,7 +476,7 @@ class TestPhantomCleanup:
         _set_occ(c.areas["area_b"], 1)
         c.areas["area_b"].last_motion = h.current_time - 60
         c.anomaly_detector.check_timeouts(
-            c.areas, h.current_time, sensors=c.sensors, probability_fn=lambda a, t: 1.0
+            c.areas, h.current_time, sensors=c.sensors, freshness_fn=lambda a, t: 1.0
         )
         assert c.get_occupancy("area_b") == 1
 
@@ -515,7 +519,7 @@ async def open_plan(hass: HomeAssistant, open_plan_config):
 
 
 class TestOpenPlan:
-    async def test_no_inflation(self, open_plan: HomeAssistant):
+    async def test_all_positive_evidence_is_kept(self, open_plan: HomeAssistant):
         c = open_plan.data[DOMAIN]["coordinator"]
         h = SensorEventHelper(c)
         h.trigger_sensor("binary_sensor.entry", True)
@@ -523,9 +527,9 @@ class TestOpenPlan:
         h.trigger_sensor("binary_sensor.kitchen", True, delay=1)
         assert c.get_occupancy("kitchen") == 1
         h.trigger_sensor("binary_sensor.dining", True, delay=1)
-        assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) == 1
+        assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) >= 1
         h.trigger_sensor("binary_sensor.living", True, delay=1)
-        assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) == 1
+        assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) >= 1
 
     async def test_leave_via_corridor(self, open_plan: HomeAssistant):
         c = open_plan.data[DOMAIN]["coordinator"]
@@ -540,4 +544,4 @@ class TestOpenPlan:
         h.trigger_sensor("binary_sensor.dining", False, delay=1)
         h.trigger_sensor("binary_sensor.corridor", True, delay=3)
         assert c.get_occupancy("corridor") == 1
-        assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) == 1
+        assert sum(c.get_occupancy(a) for a in ["kitchen", "dining", "living"]) >= 1

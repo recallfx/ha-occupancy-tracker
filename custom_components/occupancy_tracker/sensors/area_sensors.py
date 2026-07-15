@@ -14,7 +14,7 @@ from ..coordinator import OccupancyCoordinator
 class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
     """Binary sensor that is ON when an area is occupied.
 
-    Attributes expose count, probability, and last_motion for debugging.
+    Attributes expose the evidence behind the conservative state.
     """
 
     _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
@@ -33,20 +33,26 @@ class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
 
     @property
     def extra_state_attributes(self):
-        """Return count, probability, and last motion as attributes."""
+        """Return occupancy evidence and freshness attributes."""
         area_state = self.coordinator.areas.get(self._area)
         if not area_state:
             return {}
 
         now = time.time()
-        probability = self.coordinator.get_occupancy_probability(self._area, now)
+        freshness = self.coordinator.get_occupancy_freshness(self._area, now)
         last_motion = area_state.last_motion
         time_since = round(now - last_motion) if last_motion > 0 else None
 
         return {
             "occupancy_count": area_state.occupancy,
-            "probability": round(probability, 2),
+            "evidence_state": self.coordinator.get_occupancy_evidence(self._area),
+            "active_sensors": self.coordinator.get_active_sensor_ids(self._area),
+            "freshness": round(freshness, 2),
+            "probability": round(freshness, 2),
             "last_motion": last_motion if last_motion > 0 else None,
+            "last_positive_evidence": last_motion if last_motion > 0 else None,
+            "stale_since": area_state.stale_since,
+            "cleared_by": area_state.cleared_by,
             "time_since_motion_s": time_since,
             "is_indoors": area_state.is_indoors,
             "is_exit_capable": area_state.is_exit_capable,

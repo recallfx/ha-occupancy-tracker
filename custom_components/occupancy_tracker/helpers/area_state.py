@@ -10,16 +10,14 @@ class AreaState:
         self.config = area_config
         self.last_motion: float = 0
         self.last_off: float = 0  # Timestamp of last motion-OFF event
+        self.stale_since: float | None = None
+        self.cleared_by: str | None = None
         self.activity_history = []  # List of (timestamp, activity_type) tuples
         self.is_indoors = area_config.get("indoors", True)
         self.is_exit_capable = area_config.get("exit_capable", False)
         self.is_transition = area_config.get("transition", False)
-        self.open_plan_group: str | None = None
-
-        # Set by cluster rebuild, not by individual events
         self._occupied: bool = False
         self.last_occupied_at: float = 0  # Timestamp when area was last occupied
-        self.cluster_id: int | None = None
 
     @property
     def occupancy(self) -> int:
@@ -62,19 +60,24 @@ class AreaState:
         if not self._occupied:
             return False
         self._occupied = False
-        self.cluster_id = None
         self.activity_history.append((timestamp, "exit"))
         if len(self.activity_history) > MAX_HISTORY_LENGTH:
             self.activity_history.pop(0)
         return True
 
     def clear_occupancy(
-        self, timestamp: float, target_id: str | list[str] | None = None
+        self,
+        timestamp: float,
+        target_id: str | list[str] | None = None,
+        reason: str | None = None,
     ) -> None:
         """Clear all occupancy from this area."""
         if self._occupied:
             self._occupied = False
-            self.cluster_id = None
+            self.cleared_by = reason or (
+                target_id if isinstance(target_id, str) else "unspecified"
+            )
+            self.stale_since = None
             self.activity_history.append((timestamp, "clear"))
             if len(self.activity_history) > MAX_HISTORY_LENGTH:
                 self.activity_history.pop(0)
@@ -82,6 +85,8 @@ class AreaState:
     def record_motion(self, timestamp: float) -> None:
         """Record motion activity in this area."""
         self.last_motion = timestamp
+        self.stale_since = None
+        self.cleared_by = None
         self.activity_history.append((timestamp, "motion"))
         if len(self.activity_history) > MAX_HISTORY_LENGTH:
             self.activity_history.pop(0)
@@ -101,11 +106,17 @@ class AreaState:
     def reset(self) -> None:
         """Reset area state to initial values."""
         self._occupied = False
-        self.cluster_id = None
         self.last_motion = 0
         self.last_off = 0
+        self.stale_since = None
+        self.cleared_by = None
         self.last_occupied_at = 0
         self.activity_history = []
+
+    @property
+    def last_positive_evidence(self) -> float:
+        """Timestamp of the latest positive occupancy evidence."""
+        return self.last_motion
 
     @property
     def is_occupied(self) -> bool:
@@ -126,7 +137,7 @@ class _ClaimsProxy(set):
         self._area = area
         # Populate the real set contents from the bool
         if area._occupied:
-            super().add("_cluster")
+            super().add("_occupied")
 
     # --- mutators ---------------------------------------------------
 

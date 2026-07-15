@@ -229,23 +229,69 @@ async def test_coordinator_verify_history_deterministic(hass, config):
 
 @pytest.mark.asyncio
 async def test_coordinator_verify_history_preserves_state(hass, config):
-    """Test that verification doesn't permanently change system state."""
+    """Verification must not mutate any live area, sensor, or latch state."""
     coordinator = OccupancyCoordinator(hass, config)
 
     # Set up state
     now = time.time()
     coordinator.process_sensor_event("motion_a", True, now)
 
-    # Record original state
-    original_occ = coordinator.areas["room_a"].occupancy
-    original_motion = coordinator.areas["room_a"].last_motion
+    area = coordinator.areas["room_a"]
+    sensor = coordinator.sensors["motion_a"]
+    area.last_off = now - 1
+    area.stale_since = now + 1
+    area.cleared_by = "test_marker"
+    area.activity_history.append((now + 1, "test_marker"))
+
+    original_area = (
+        area.occupancy,
+        area.last_motion,
+        area.last_off,
+        area.stale_since,
+        area.cleared_by,
+        area.last_occupied_at,
+        list(area.activity_history),
+    )
+    original_sensor = (
+        sensor.current_state,
+        sensor.last_changed,
+        sensor.activated_at,
+        sensor.last_update_time,
+        [(item.state, item.timestamp) for item in sensor.history],
+        sensor.is_available,
+        sensor.is_reliable,
+        sensor.is_stuck,
+    )
+    original_latched = set(coordinator.occupancy_resolver.indoor_latched)
+    original_first_activation = coordinator.occupancy_resolver._first_activation_time
 
     # Verify (internally resets and replays)
     coordinator.verify_history()
 
-    # Check state is restored
-    assert coordinator.areas["room_a"].occupancy == original_occ
-    assert coordinator.areas["room_a"].last_motion == original_motion
+    assert (
+        area.occupancy,
+        area.last_motion,
+        area.last_off,
+        area.stale_since,
+        area.cleared_by,
+        area.last_occupied_at,
+        area.activity_history,
+    ) == original_area
+    assert (
+        sensor.current_state,
+        sensor.last_changed,
+        sensor.activated_at,
+        sensor.last_update_time,
+        [(item.state, item.timestamp) for item in sensor.history],
+        sensor.is_available,
+        sensor.is_reliable,
+        sensor.is_stuck,
+    ) == original_sensor
+    assert coordinator.occupancy_resolver.indoor_latched == original_latched
+    assert (
+        coordinator.occupancy_resolver._first_activation_time
+        == original_first_activation
+    )
 
 
 def test_state_difference_string_representation():

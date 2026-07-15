@@ -18,13 +18,12 @@ class AnomalyDetector:
         self.config = config
         self.warnings: List[Warning] = []
         self.recent_motion_window = 120  # 2 minutes
-        self.motion_timeout = 24 * 3600  # 24 hours
         self.extended_occupancy_threshold = 12 * 3600  # 12 hours
         self.adjacency_map = self._build_adjacency(config)
 
-        # Phantom occupancy cleanup thresholds
+        # Stale-looking occupancy diagnostic thresholds
         self.phantom_inactivity_threshold = 1800  # 30 minutes
-        self.phantom_probability_threshold = 0.20
+        self.phantom_freshness_threshold = 0.20
         self.phantom_neighbor_activity_window = 1800  # 30 minutes
         self.phantom_magnetic_window = 1800  # 30 minutes
 
@@ -90,51 +89,35 @@ class AnomalyDetector:
         areas: Dict[str, AreaState],
         timestamp: float,
         sensors: Optional[Dict[str, SensorState]] = None,
-        probability_fn: Optional[Callable[[str, float], float]] = None,
-    ) -> List[str]:
-        """Check for timeout conditions like inactivity and extended occupancy."""
-        cleared_area_ids: List[str] = []
+        freshness_fn: Optional[Callable[[str, float], float]] = None,
+    ) -> None:
+        """Report timeout conditions without changing occupancy."""
 
         for area_id, area in areas.items():
-            # Check exit-capable areas for auto-clear (shorter timeout)
-            if area.is_exit_capable and area.occupancy > 0:
-                # Exit-capable areas clear after 5 minutes of inactivity
-                # (people can leave the system from these areas)
+            # Exit-capable outdoor areas become suspicious sooner.
+            if area.is_exit_capable and not area.is_indoors and area.occupancy > 0:
                 exit_timeout = 300  # 5 minutes
                 inactivity_duration = area.get_inactivity_duration(timestamp)
 
-                if inactivity_duration > exit_timeout:
-                    logger.info(
-                        f"Auto-clearing exit-capable area {area_id} after {inactivity_duration:.0f}s of inactivity"
-                    )
-                    area.clear_occupancy(timestamp, target_id="timeout")
+                has_warning = any(
+                    warning.is_active
+                    and warning.type == "exit_area_stale"
+                    and warning.area == area_id
+                    for warning in self.warnings
+                )
+                if inactivity_duration > exit_timeout and not has_warning:
                     self._create_warning(
-                        "exit_area_auto_clear",
-                        f"Exit-capable area {area_id} was auto-cleared after {inactivity_duration / 60:.1f} minutes of inactivity",
+                        "exit_area_stale",
+                        f"Exit-capable area {area_id} may be stale after "
+                        f"{inactivity_duration / 60:.1f} minutes of inactivity",
                         area=area_id,
                         timestamp=timestamp,
                     )
-                    continue  # Skip regular timeout checks for this area
 
-            # Check for inactivity timeout if area is occupied
             if area.occupancy > 0:
                 inactivity_duration = area.get_inactivity_duration(timestamp)
 
-                # Reset room after 24 hours of inactivity
-                if inactivity_duration > self.motion_timeout:
-                    logger.warning(
-                        f"Resetting area {area_id} due to {inactivity_duration / 3600:.1f} hours of inactivity"
-                    )
-                    area.clear_occupancy(timestamp, target_id="timeout")
-                    self._create_warning(
-                        "inactivity_timeout",
-                        f"Area {area_id} was reset after {inactivity_duration / 3600:.1f} hours of inactivity",
-                        area=area_id,
-                        timestamp=timestamp,
-                    )
-
-                # Warning for extended occupancy (12+ hours)
-                elif inactivity_duration > self.extended_occupancy_threshold:
+                if inactivity_duration > self.extended_occupancy_threshold:
                     # Check if we already have an active warning for this
                     has_warning = any(
                         w.is_active
@@ -150,32 +133,26 @@ class AnomalyDetector:
                             timestamp=timestamp,
                         )
 
-        if sensors is not None and probability_fn is not None:
-            cleared_area_ids.extend(
-                self._check_phantom_occupancy(areas, timestamp, sensors, probability_fn)
-            )
-
-        return cleared_area_ids
+        if sensors is not None and freshness_fn is not None:
+            self._check_phantom_occupancy(areas, timestamp, sensors, freshness_fn)
 
     def _check_phantom_occupancy(
         self,
         areas: Dict[str, AreaState],
         timestamp: float,
         sensors: Dict[str, SensorState],
-        probability_fn: Callable[[str, float], float],
-    ) -> List[str]:
-        """Clear occupancy when all evidence suggests a phantom occupant.
+        freshness_fn: Callable[[str, float], float],
+    ) -> None:
+        """Report occupancy when all evidence suggests a phantom occupant.
 
-        Only clears when ALL conditions are true:
+        Warns only when ALL conditions are true:
         1. Inactivity exceeds threshold (30 min)
-        2. Probability has decayed below threshold (~170 min)
+        2. Freshness has decayed below threshold (~170 min)
         3. The area's own motion sensors are inactive
         4. All neighboring areas are quiet (protects sleeping people)
         5. No recent magnetic events (door/window)
         6. Area is not exit-capable
         """
-        cleared_area_ids: List[str] = []
-
         for area_id, area in areas.items():
             if area.occupancy <= 0:
                 continue
@@ -187,11 +164,11 @@ class AnomalyDetector:
             if inactivity < self.phantom_inactivity_threshold:
                 continue
 
-            probability = probability_fn(area_id, timestamp)
-            if probability >= self.phantom_probability_threshold:
+            freshness = freshness_fn(area_id, timestamp)
+            if freshness >= self.phantom_freshness_threshold:
                 continue
 
-            # Current sensor state is stronger evidence than probability decay.
+            # Current sensor state is stronger evidence than freshness decay.
             own_sensor_active = any(
                 sensor.is_trusted_active
                 and sensor.config.get("type", "") in MOTION_SENSOR_TYPES
@@ -248,24 +225,22 @@ class AnomalyDetector:
             if recent_magnetic:
                 continue
 
-            # All conditions met — clear phantom occupancy
-            logger.info(
-                f"Clearing phantom occupancy in {area_id}: "
-                f"inactive {inactivity / 60:.0f}min, probability {probability:.2f}, "
-                f"no neighbor activity, no recent magnetic events"
+            # PIR silence cannot distinguish vacancy from a still occupant.
+            has_warning = any(
+                warning.is_active
+                and warning.type == "phantom_occupancy_suspected"
+                and warning.area == area_id
+                for warning in self.warnings
             )
-            area.clear_occupancy(timestamp)
-            cleared_area_ids.append(area_id)
-            self._create_warning(
-                "phantom_occupancy_cleared",
-                f"Phantom occupancy cleared in {area_id} after "
-                f"{inactivity / 60:.0f} minutes of inactivity "
-                f"(probability: {probability:.0%})",
-                area=area_id,
-                timestamp=timestamp,
-            )
-
-        return cleared_area_ids
+            if not has_warning:
+                self._create_warning(
+                    "phantom_occupancy_suspected",
+                    f"Occupancy in {area_id} may be stale after "
+                    f"{inactivity / 60:.0f} minutes of inactivity "
+                    f"(freshness: {freshness:.0%})",
+                    area=area_id,
+                    timestamp=timestamp,
+                )
 
     def _create_warning(
         self,

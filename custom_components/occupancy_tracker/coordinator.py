@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 import math
 import time
-from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
@@ -25,8 +25,8 @@ from .diagnostics import OccupancyDiagnostics
 
 _LOGGER = logging.getLogger("coordinator")
 
-# Periodic update interval for consistency checks
-PERIODIC_UPDATE_INTERVAL = timedelta(seconds=5)
+STORAGE_VERSION = 1
+STORAGE_KEY = f"{DOMAIN}.occupancy_state"
 
 
 class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
@@ -36,7 +36,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         self,
         hass: HomeAssistant,
         config: OccupancyTrackerConfig,
-        enable_periodic_updates: bool = True,
+        store: Store[dict[str, Any]] | None = None,
     ) -> None:
         """Initialize the coordinator."""
         request_refresh_debouncer = Debouncer(
@@ -46,14 +46,11 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             immediate=True,
         )
 
-        # Use periodic updates in production, disable in tests
-        update_interval = PERIODIC_UPDATE_INTERVAL if enable_periodic_updates else None
-
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=update_interval,
+            update_interval=None,
             request_refresh_debouncer=request_refresh_debouncer,
         )
         self.config = config
@@ -70,12 +67,68 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         self.state_recorder = MapStateRecorder()
         self.occupancy_resolver = MapOccupancyResolver(config)
         self.log_formatter = LogFormatter(self.areas, self.sensors)
+        self._store = store or Store(
+            hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True
+        )
 
         # Initialize diagnostics
         self.diagnostics = OccupancyDiagnostics(self)
 
         # Publish initial state immediately so entities don't show stale restored data
         self.data = self.diagnostics.get_system_status()
+
+    async def async_restore_occupancy(self) -> None:
+        """Restore conservative indoor occupancy before sensor baselines."""
+        stored = await self._store.async_load()
+        if not stored:
+            return
+        if not isinstance(stored, dict):
+            _LOGGER.warning("Ignoring invalid stored occupancy state")
+            return
+
+        stored_areas = stored.get("areas")
+        if not isinstance(stored_areas, dict):
+            _LOGGER.warning("Ignoring invalid stored occupancy state")
+            return
+
+        restored: list[str] = []
+        restore_time = time.time()
+        for area_id, area_data in stored_areas.items():
+            area = self.areas.get(area_id)
+            if not area or not area.is_indoors or not isinstance(area_data, dict):
+                continue
+
+            last_motion = area_data.get("last_motion")
+            if isinstance(last_motion, (int, float)) and last_motion > 0:
+                area.last_motion = float(last_motion)
+            area.stale_since = restore_time
+            area.cleared_by = None
+            area.occupied = True
+            self.occupancy_resolver.indoor_latched.add(area_id)
+            restored.append(area_id)
+
+        if restored:
+            self.state_recorder.record_restore_event(
+                time.time(), restored, self.areas, self.sensors
+            )
+            _LOGGER.info("Restored occupied areas: %s", ", ".join(sorted(restored)))
+            self.data = self.diagnostics.get_system_status()
+
+    def _stored_occupancy(self) -> dict[str, Any]:
+        """Build the minimal durable conservative-occupancy state."""
+        return {
+            "areas": {
+                area_id: {
+                    "last_motion": self.areas[area_id].last_motion,
+                }
+                for area_id in sorted(self.occupancy_resolver.indoor_latched)
+                if area_id in self.areas and self.areas[area_id].is_indoors
+            }
+        }
+
+    def _schedule_occupancy_save(self) -> None:
+        """Persist a latch change without blocking sensor processing."""
+        self._store.async_delay_save(self._stored_occupancy)
 
     def _initialize_areas(self, config: OccupancyTrackerConfig) -> None:
         """Initialize area tracking objects from configuration."""
@@ -104,6 +157,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
         # Capture state before processing (all areas, not just linked ones)
         old_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
+        old_latched = set(self.occupancy_resolver.indoor_latched)
 
         # Update sensor state
         was_available = sensor.is_available
@@ -131,6 +185,9 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 snapshot, self.areas, self.sensors, self.anomaly_detector
             )
 
+            if old_latched != self.occupancy_resolver.indoor_latched:
+                self._schedule_occupancy_save()
+
             # Check for stuck sensors after processing
             self._check_for_stuck_sensors(sensor_id, timestamp)
 
@@ -155,7 +212,21 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         sensor.mark_unavailable(timestamp)
         if was_available:
             self._record_sensor_availability(sensor_id, False, timestamp)
+            self._refresh_after_trust_change(timestamp)
+            self._refresh_latest_snapshot_state()
         self.async_set_updated_data(self.diagnostics.get_system_status())
+
+    def _refresh_after_trust_change(self, timestamp: float) -> None:
+        """Apply current trusted sensor state and mark quiet latches stale."""
+        self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
+        for area_id in self.occupancy_resolver.indoor_latched:
+            area = self.areas.get(area_id)
+            if (
+                area
+                and not self.get_active_sensor_ids(area_id)
+                and area.stale_since is None
+            ):
+                area.stale_since = timestamp
 
     def seed_sensor_state(self, sensor_id: str, state: bool, timestamp: float) -> None:
         """Set an initial HA state without replaying it as a fresh edge."""
@@ -237,17 +308,49 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         self, triggered_sensor_id: str, timestamp: float
     ) -> None:
         """Check for stuck sensors when a sensor is triggered."""
+        trusted_before = {
+            sensor_id: sensor.is_trusted_active
+            for sensor_id, sensor in self.sensors.items()
+        }
         self.anomaly_detector.check_for_stuck_sensors(
             self.sensors, self.areas, triggered_sensor_id
         )
+        if any(
+            trusted_before[sensor_id] != sensor.is_trusted_active
+            for sensor_id, sensor in self.sensors.items()
+        ):
+            self._refresh_after_trust_change(timestamp)
 
     def get_occupancy(self, area_id: str) -> int:
         """Get current occupancy count for an area."""
         area = self.areas.get(area_id)
         return area.occupancy if area else 0
 
-    def get_occupancy_probability(self, area_id: str, timestamp: float = None) -> float:
-        """Get probability score (0-1) that area is occupied."""
+    def get_active_sensor_ids(self, area_id: str) -> list[str]:
+        """Return trusted active motion sensors providing live evidence."""
+        return sorted(
+            sensor.id
+            for sensor in self.sensors.values()
+            if sensor.is_trusted_active
+            and sensor.config.get("type", "") in MOTION_SENSOR_TYPES
+            and area_id in sensor.area_ids
+        )
+
+    def get_occupancy_evidence(self, area_id: str) -> str:
+        """Explain why an area currently reports occupied or vacant."""
+        area = self.areas.get(area_id)
+        if area is None:
+            return "vacant"
+        if self.get_active_sensor_ids(area_id):
+            return "active"
+        if area_id in self.occupancy_resolver.indoor_latched:
+            return "stale"
+        if area.occupied:
+            return "inferred"
+        return "vacant"
+
+    def get_occupancy_freshness(self, area_id: str, timestamp: float = None) -> float:
+        """Get a time-since-motion freshness score from 0 to 1."""
         area = self.areas.get(area_id)
         if not area:
             return 0.0
@@ -276,9 +379,13 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         # Decay from 0.9 down to 0.1 over 1 hour (3600s)
         k = 0.00021
         decay_time = time_since_motion - 300
-        probability = 0.1 + 0.8 * math.exp(-k * decay_time)
+        freshness = 0.1 + 0.8 * math.exp(-k * decay_time)
 
-        return round(probability, 2)
+        return round(freshness, 2)
+
+    def get_occupancy_probability(self, area_id: str, timestamp: float = None) -> float:
+        """Compatibility alias for the historical probability API."""
+        return self.get_occupancy_freshness(area_id, timestamp)
 
     def get_warnings(self, active_only: bool = True) -> List[Warning]:
         """Get list of warnings."""
@@ -288,19 +395,18 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         """Check for timeout conditions."""
         if timestamp is None:
             timestamp = time.time()
-        cleared_area_ids = self.anomaly_detector.check_timeouts(
+        self.anomaly_detector.check_timeouts(
             self.areas,
             timestamp,
             sensors=self.sensors,
-            probability_fn=self.get_occupancy_probability,
+            freshness_fn=self.get_occupancy_freshness,
         )
-        self._clear_resolver_retention(cleared_area_ids)
         self.state_recorder.maybe_record_tick(
             timestamp,
             self.areas,
             self.sensors,
         )
-        # Always update data to reflect probability decay
+        # Always update data to reflect freshness decay.
         self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def resolve_warning(self, warning_id: str) -> bool:
@@ -328,10 +434,25 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         """Clear all active warnings without altering other state."""
         if self.anomaly_detector.clear_warnings():
             _LOGGER.info("Active warnings cleared")
-            self.async_set_updated_data(self.diagnostics.get_system_status())
+        self.async_set_updated_data(self.diagnostics.get_system_status())
+
+    def clear_stale_occupancy(self) -> None:
+        """Clear conservatively latched rooms whose sensors are currently off."""
+        timestamp = time.time()
+        cleared = self.occupancy_resolver.clear_stale_indoor_occupancy(
+            timestamp, self.areas, self.sensors
+        )
+        if cleared:
+            self.state_recorder.record_clear_event(
+                timestamp, cleared, self.areas, self.sensors
+            )
+            self._schedule_occupancy_save()
+            _LOGGER.info("Cleared stale occupancy: %s", ", ".join(sorted(cleared)))
+        self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def reset(self) -> None:
         """Reset the entire system state."""
+        had_latched_occupancy = bool(self.occupancy_resolver.indoor_latched)
         # Reset all areas using proper reset method
         for area in self.areas.values():
             area.reset()
@@ -345,6 +466,9 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         # Create new anomaly detector and state recorder
         self.anomaly_detector = AnomalyDetector(self.config)
         self.state_recorder.reset()
+
+        if had_latched_occupancy:
+            self._schedule_occupancy_save()
 
         _LOGGER.info("Occupancy tracker system reset")
         self.async_set_updated_data(self.diagnostics.get_system_status())
@@ -383,35 +507,34 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
         # Save current state
         original_areas = {
-            aid: (area.occupancy, area.last_motion) for aid, area in self.areas.items()
+            aid: (
+                area.occupancy,
+                area.last_motion,
+                area.last_off,
+                area.stale_since,
+                area.cleared_by,
+                area.last_occupied_at,
+                list(area.activity_history),
+            )
+            for aid, area in self.areas.items()
         }
         original_sensors = {
             sid: (
                 sensor.current_state,
                 sensor.last_changed,
+                sensor.activated_at,
+                sensor.last_update_time,
+                list(sensor.history),
                 sensor.is_available,
                 sensor.is_reliable,
                 sensor.is_stuck,
             )
             for sid, sensor in self.sensors.items()
         }
+        original_latched = set(self.occupancy_resolver.indoor_latched)
+        original_first_activation = self.occupancy_resolver._first_activation_time
 
         try:
-            # Reset and replay
-            for area in self.areas.values():
-                area.occupancy = 0
-                area.last_motion = 0
-                area.activity_history = []
-
-            for sensor in self.sensors.values():
-                sensor.current_state = False
-                sensor.history = []
-                sensor.is_available = True
-                sensor.is_reliable = True
-                sensor.is_stuck = False
-
-            self.occupancy_resolver.reset()
-
             # Replay history
             self.occupancy_resolver.recalculate_from_history(
                 history,
@@ -439,55 +562,50 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
         finally:
             # Restore original state
-            for aid, (occ, motion) in original_areas.items():
+            for aid, (
+                occupancy,
+                last_motion,
+                last_off,
+                stale_since,
+                cleared_by,
+                last_occupied_at,
+                activity_history,
+            ) in original_areas.items():
                 if aid in self.areas:
-                    self.areas[aid].occupancy = occ
-                    self.areas[aid].last_motion = motion
+                    area = self.areas[aid]
+                    area.occupancy = occupancy
+                    area.last_motion = last_motion
+                    area.last_off = last_off
+                    area.stale_since = stale_since
+                    area.cleared_by = cleared_by
+                    area.last_occupied_at = last_occupied_at
+                    area.activity_history = activity_history
 
             for sid, (
                 state,
                 changed,
+                activated_at,
+                last_update_time,
+                history,
                 available,
                 reliable,
                 stuck,
             ) in original_sensors.items():
                 if sid in self.sensors:
-                    self.sensors[sid].current_state = state
-                    self.sensors[sid].last_changed = changed
-                    self.sensors[sid].is_available = available
-                    self.sensors[sid].is_reliable = reliable
-                    self.sensors[sid].is_stuck = stuck
+                    sensor = self.sensors[sid]
+                    sensor.current_state = state
+                    sensor.last_changed = changed
+                    sensor.activated_at = activated_at
+                    sensor.last_update_time = last_update_time
+                    sensor.history = history
+                    sensor.is_available = available
+                    sensor.is_reliable = reliable
+                    sensor.is_stuck = stuck
+
+            self.occupancy_resolver.indoor_latched.clear()
+            self.occupancy_resolver.indoor_latched.update(original_latched)
+            self.occupancy_resolver._first_activation_time = original_first_activation
 
     def diagnose_motion_issues(self, sensor_id: str = None) -> Dict[str, Any]:
         """Diagnostic method to help identify why motion isn't being detected."""
         return self.diagnostics.diagnose_motion_issues(sensor_id)
-
-    async def _async_update_data(self) -> Dict[str, Any]:
-        """Periodic update — timeout checks and phantom cleanup."""
-        timestamp = time.time()
-
-        old_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
-
-        cleared_area_ids = self.anomaly_detector.check_timeouts(
-            self.areas,
-            timestamp,
-            sensors=self.sensors,
-            probability_fn=self.get_occupancy_probability,
-        )
-        self._clear_resolver_retention(cleared_area_ids)
-
-        new_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
-        if old_occupancy != new_occupancy:
-            state_view = self.log_formatter.format_state_view(self.areas, self.sensors)
-            changes = self.log_formatter.format_occupancy_changes(
-                old_occupancy, new_occupancy
-            )
-            if changes:
-                _LOGGER.info(f"⏱️ periodic | {changes} | {state_view}")
-
-        return self.diagnostics.get_system_status()
-
-    def _clear_resolver_retention(self, area_ids: List[str]) -> None:
-        """Remove areas phantom cleanup already cleared from resolver retention."""
-        for area_id in area_ids:
-            self.occupancy_resolver.retained.pop(area_id, None)
