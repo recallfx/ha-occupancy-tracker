@@ -61,6 +61,20 @@ class TestAsyncSetup:
         assert "living_room" in coordinator.areas
         assert "kitchen" in coordinator.areas
 
+    async def test_coordinator_refresh_returns_current_status(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """Entity startup refreshes must not call the unimplemented base hook."""
+        coordinator = OccupancyCoordinator(hass, sample_config[DOMAIN])
+
+        data = await coordinator._async_update_data()
+
+        assert data["occupied_areas"] == {}
+        assert data["area_evidence"] == {
+            "living_room": "vacant",
+            "kitchen": "vacant",
+        }
+
     async def test_setup_seeds_current_on_sensor_state(
         self, hass: HomeAssistant, sample_config
     ):

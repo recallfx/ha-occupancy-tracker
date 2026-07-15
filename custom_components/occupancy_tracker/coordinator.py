@@ -77,6 +77,10 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         # Publish initial state immediately so entities don't show stale restored data
         self.data = self.diagnostics.get_system_status()
 
+    async def _async_update_data(self) -> Dict[str, Any]:
+        """Return current state when a coordinator entity requests a refresh."""
+        return self.diagnostics.get_system_status()
+
     async def async_restore_occupancy(self) -> None:
         """Restore conservative indoor occupancy before sensor baselines."""
         stored = await self._store.async_load()
