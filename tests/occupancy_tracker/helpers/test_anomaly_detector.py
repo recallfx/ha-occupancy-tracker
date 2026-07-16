@@ -229,6 +229,16 @@ class TestAnomalyDetector:
         warnings = detector.get_warnings()
         assert len(warnings) == 1
 
+    def test_check_timeouts_skips_unknown_inactivity_duration(self):
+        """Restored occupancy without a motion timestamp is not infinite inactivity."""
+        detector = AnomalyDetector({"areas": {}, "adjacency": {}, "sensors": {}})
+        area = AreaState("bedroom", {"name": "Bedroom"})
+        _set_occupancy(area, 1)
+
+        detector.check_timeouts({"bedroom": area}, time.time())
+
+        assert detector.get_warnings() == []
+
     def test_isolated_area_motion_is_not_unexpected(self):
         """An isolated area's own sensor is valid occupancy evidence."""
         timestamp = time.time()

@@ -99,10 +99,14 @@ class AnomalyDetector:
         """Report timeout conditions without changing occupancy."""
 
         for area_id, area in areas.items():
+            if area.occupancy <= 0 or area.last_motion <= 0:
+                continue
+
+            inactivity_duration = area.get_inactivity_duration(timestamp)
+
             # Exit-capable outdoor areas become suspicious sooner.
-            if area.is_exit_capable and not area.is_indoors and area.occupancy > 0:
+            if area.is_exit_capable and not area.is_indoors:
                 exit_timeout = 300  # 5 minutes
-                inactivity_duration = area.get_inactivity_duration(timestamp)
 
                 has_warning = any(
                     warning.is_active
@@ -119,24 +123,18 @@ class AnomalyDetector:
                         timestamp=timestamp,
                     )
 
-            if area.occupancy > 0:
-                inactivity_duration = area.get_inactivity_duration(timestamp)
-
-                if inactivity_duration > self.extended_occupancy_threshold:
-                    # Check if we already have an active warning for this
-                    has_warning = any(
-                        w.is_active
-                        and w.type == "extended_occupancy"
-                        and w.area == area_id
-                        for w in self.warnings
+            if inactivity_duration > self.extended_occupancy_threshold:
+                has_warning = any(
+                    w.is_active and w.type == "extended_occupancy" and w.area == area_id
+                    for w in self.warnings
+                )
+                if not has_warning:
+                    self._create_warning(
+                        "extended_occupancy",
+                        f"Area {area_id} has been occupied for {inactivity_duration / 3600:.1f} hours with limited activity",
+                        area=area_id,
+                        timestamp=timestamp,
                     )
-                    if not has_warning:
-                        self._create_warning(
-                            "extended_occupancy",
-                            f"Area {area_id} has been occupied for {inactivity_duration / 3600:.1f} hours with limited activity",
-                            area=area_id,
-                            timestamp=timestamp,
-                        )
 
         if sensors is not None and freshness_fn is not None:
             self._check_phantom_occupancy(areas, timestamp, sensors, freshness_fn)
