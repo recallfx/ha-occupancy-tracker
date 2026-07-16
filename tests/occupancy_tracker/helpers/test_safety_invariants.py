@@ -165,6 +165,40 @@ def test_explicit_clear_removes_only_stale_indoor_occupancy():
     assert areas["active"].occupied
 
 
+def test_targeted_clear_does_not_clear_other_stale_rooms():
+    """Per-room cleanup must not turn into a whole-house absence assertion."""
+    now = time.time()
+    config = {
+        "areas": {"study": {}, "bedroom": {}},
+        "adjacency": {},
+        "sensors": {},
+    }
+    resolver = MapOccupancyResolver(config)
+    areas = {
+        area_id: AreaState(area_id, value) for area_id, value in config["areas"].items()
+    }
+    sensors = {
+        f"s.{area_id}": SensorState(
+            f"s.{area_id}", {"area": area_id, "type": "motion"}, now
+        )
+        for area_id in areas
+    }
+    for index, area_id in enumerate(areas):
+        _fire(resolver, areas, sensors, f"s.{area_id}", True, now + index)
+        _fire(resolver, areas, sensors, f"s.{area_id}", False, now + index + 0.5)
+
+    cleared = resolver.clear_stale_indoor_occupancy(
+        now + 10,
+        areas,
+        sensors,
+        area_ids={"study"},
+    )
+
+    assert cleared == ["study"]
+    assert not areas["study"].occupied
+    assert areas["bedroom"].occupied
+
+
 def test_explicit_clear_survives_history_replay():
     """Replaying sensor history must not resurrect manually cleared occupancy."""
     now = time.time()

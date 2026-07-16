@@ -9,6 +9,7 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from ..coordinator import OccupancyCoordinator
+from ..helpers.constants import ACTIVITY_HOLD_SECONDS
 
 
 class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
@@ -56,4 +57,52 @@ class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
             "time_since_motion_s": time_since,
             "is_indoors": area_state.is_indoors,
             "is_exit_capable": area_state.is_exit_capable,
+        }
+
+
+class AreaActivityBinarySensor(CoordinatorEntity, BinarySensorEntity):
+    """Short-lived room activity; never authoritative for safe occupancy."""
+
+    _attr_device_class = BinarySensorDeviceClass.MOTION
+
+    def __init__(self, coordinator: OccupancyCoordinator, area: str):
+        super().__init__(coordinator)
+        self._area = area
+        area_name = coordinator.config["areas"][area].get("name", area)
+        self._attr_name = f"{area_name} Activity"
+        self._attr_unique_id = f"activity_{area}"
+
+    def _activity_source(self, now: float) -> str:
+        if self.coordinator.get_active_sensor_ids(self._area):
+            return "live"
+
+        area = self.coordinator.areas.get(self._area)
+        if area and area.last_motion > 0:
+            age = now - area.last_motion
+            if age <= ACTIVITY_HOLD_SECONDS:
+                return "recent"
+        return "none"
+
+    @property
+    def is_on(self) -> bool:
+        """Return whether the room has live or recent activity."""
+        return self._activity_source(time.time()) != "none"
+
+    @property
+    def extra_state_attributes(self):
+        """Explain the short-lived activity signal and its safe counterpart."""
+        area = self.coordinator.areas.get(self._area)
+        if not area:
+            return {}
+
+        now = time.time()
+        last_motion = area.last_motion
+        age = max(0, round(now - last_motion)) if last_motion > 0 else None
+        return {
+            "activity_source": self._activity_source(now),
+            "hold_seconds": ACTIVITY_HOLD_SECONDS,
+            "last_activity": last_motion if last_motion > 0 else None,
+            "activity_age_s": age,
+            "safe_occupancy": area.occupied,
+            "occupancy_evidence": self.coordinator.get_occupancy_evidence(self._area),
         }

@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .area_state import AreaState
 from .map_state_recorder import MapSnapshot
 from .sensor_state import SensorState
+
+if TYPE_CHECKING:
+    from .map_occupancy_resolver import MapOccupancyResolver
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -101,6 +104,84 @@ class HistoryVerifier:
             _LOGGER.info("History verification passed: recorded state matches replay")
 
         return not has_differences
+
+    def replay_and_verify(
+        self,
+        recorded_snapshots: List[MapSnapshot],
+        resolver: MapOccupancyResolver,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> bool:
+        """Replay history for verification without mutating live state."""
+        original_areas = {
+            area_id: (
+                area.occupancy,
+                area.last_motion,
+                area.last_off,
+                area.stale_since,
+                area.cleared_by,
+                area.last_occupied_at,
+                list(area.activity_history),
+            )
+            for area_id, area in areas.items()
+        }
+        original_sensors = {
+            sensor_id: (
+                sensor.current_state,
+                sensor.last_changed,
+                sensor.activated_at,
+                sensor.last_update_time,
+                list(sensor.history),
+                sensor.is_available,
+                sensor.is_reliable,
+                sensor.is_stuck,
+            )
+            for sensor_id, sensor in sensors.items()
+        }
+        original_latched = set(resolver.indoor_latched)
+        original_first_activation = resolver._first_activation_time
+
+        try:
+            resolver.recalculate_from_history(
+                recorded_snapshots,
+                areas,
+                sensors,
+                None,
+            )
+            return self.verify_history(recorded_snapshots, areas, sensors)
+        finally:
+            for area_id, state in original_areas.items():
+                area = areas.get(area_id)
+                if not area:
+                    continue
+                (
+                    area.occupancy,
+                    area.last_motion,
+                    area.last_off,
+                    area.stale_since,
+                    area.cleared_by,
+                    area.last_occupied_at,
+                    area.activity_history,
+                ) = state
+
+            for sensor_id, state in original_sensors.items():
+                sensor = sensors.get(sensor_id)
+                if not sensor:
+                    continue
+                (
+                    sensor.current_state,
+                    sensor.last_changed,
+                    sensor.activated_at,
+                    sensor.last_update_time,
+                    sensor.history,
+                    sensor.is_available,
+                    sensor.is_reliable,
+                    sensor.is_stuck,
+                ) = state
+
+            resolver.indoor_latched.clear()
+            resolver.indoor_latched.update(original_latched)
+            resolver._first_activation_time = original_first_activation
 
     def verify_all_snapshots(
         self,

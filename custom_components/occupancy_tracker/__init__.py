@@ -7,7 +7,7 @@ import time
 
 import voluptuous as vol
 
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.event import (
@@ -16,7 +16,7 @@ from homeassistant.helpers.event import (
 )
 from datetime import timedelta
 
-from .const import DOMAIN
+from .const import ATTR_AREA_ID, DOMAIN, SERVICE_CLEAR_STALE_OCCUPANCY
 from .helpers.constants import MOTION_SENSOR_TYPES
 from .helpers.types import OccupancyTrackerConfig
 from .coordinator import OccupancyCoordinator
@@ -179,6 +179,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # Store the coordinator
     hass.data[DOMAIN] = {"coordinator": coordinator}
 
+    async def clear_stale_occupancy_service(call: ServiceCall) -> None:
+        """Clear only the room explicitly asserted empty by the caller."""
+        coordinator.clear_stale_occupancy([call.data[ATTR_AREA_ID]])
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CLEAR_STALE_OCCUPANCY,
+        clear_stale_occupancy_service,
+        schema=vol.Schema(
+            {vol.Required(ATTR_AREA_ID): vol.In(sorted(coordinator.areas))}
+        ),
+    )
+
     async def state_change_listener(event: Event) -> None:
         """Handle state changes for sensors."""
         # Since sensor names are assumed to be the actual HA entity IDs,
@@ -249,6 +262,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def _cleanup_timer(event):
         remove_interval()
+        hass.services.async_remove(DOMAIN, SERVICE_CLEAR_STALE_OCCUPANCY)
         # Also stop the coordinator's periodic updates
         await coordinator.async_shutdown()
 

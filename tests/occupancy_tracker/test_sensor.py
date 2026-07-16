@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock
 from homeassistant.core import HomeAssistant
 from custom_components.occupancy_tracker.sensors import (
     AnomalySensor,
+    AreaActivityBinarySensor,
     AreaOccupancyBinarySensor,
 )
 from custom_components.occupancy_tracker.sensor import (
@@ -146,6 +147,57 @@ class TestAreaOccupancyBinarySensor:
         assert sensor.device_class == "occupancy"
 
 
+class TestAreaActivityBinarySensor:
+    """Test the short-lived, non-authoritative activity signal."""
+
+    def test_recent_activity_expires_without_clearing_safe_occupancy(self, coordinator):
+        area = coordinator.areas["living_room"]
+        area.record_motion(1000.0)
+        area.occupied = True
+        coordinator.occupancy_resolver.indoor_latched.add("living_room")
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                "custom_components.occupancy_tracker.sensors.area_sensors.time.time",
+                lambda: 1119.0,
+            )
+            assert sensor.is_on is True
+            assert sensor.extra_state_attributes["activity_source"] == "recent"
+
+            monkeypatch.setattr(
+                "custom_components.occupancy_tracker.sensors.area_sensors.time.time",
+                lambda: 1121.0,
+            )
+            assert sensor.is_on is False
+
+        assert coordinator.get_occupancy("living_room") == 1
+
+    def test_live_trusted_sensor_is_activity_even_with_old_timestamp(self, coordinator):
+        sensor_state = coordinator.sensors["binary_sensor.living_room_motion"]
+        sensor_state.current_state = True
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        assert sensor.is_on is True
+        assert sensor.extra_state_attributes["activity_source"] == "live"
+
+    def test_unavailable_sensor_is_not_live_activity(self, coordinator):
+        sensor_state = coordinator.sensors["binary_sensor.living_room_motion"]
+        sensor_state.current_state = True
+        sensor_state.mark_unavailable(time.time())
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        assert sensor.is_on is False
+        assert sensor.extra_state_attributes["activity_source"] == "none"
+
+    def test_identity_and_device_class(self, coordinator):
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        assert sensor._attr_name == "Living Room Activity"
+        assert sensor._attr_unique_id == "activity_living_room"
+        assert sensor.device_class == "motion"
+
+
 class TestAnomalySensor:
     """Test AnomalySensor class."""
 
@@ -251,9 +303,10 @@ class TestAsyncSetupPlatforms:
         assert async_add_entities.called
         entities = async_add_entities.call_args[0][0]
 
-        # One binary sensor per area
-        assert len(entities) == 2
-        assert all(isinstance(e, AreaOccupancyBinarySensor) for e in entities)
+        # One safe-occupancy and one short-lived activity sensor per area.
+        assert len(entities) == 4
+        assert sum(isinstance(e, AreaOccupancyBinarySensor) for e in entities) == 2
+        assert sum(isinstance(e, AreaActivityBinarySensor) for e in entities) == 2
 
     async def test_sensor_platform(self, hass):
         """Test sensor platform creates only anomaly sensor."""

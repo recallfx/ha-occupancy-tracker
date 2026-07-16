@@ -21,14 +21,6 @@ class MapOccupancyResolver:
     explicit clear; adjacency is used only to explain suspicious activations.
     """
 
-    # Timing constants
-    PLAUSIBLE_SOURCE_WINDOW = 10.0
-    OUTDOOR_INTRUSION_WINDOW = 300.0  # Magnetic evidence window
-    BOOTSTRAP_WINDOW = 120.0  # After restart, allow any indoor activation for 2 min
-    RECENTLY_OCCUPIED_WINDOW = (
-        300.0  # Accept re-activation of rooms occupied within 5 min
-    )
-
     def __init__(self, config: OccupancyTrackerConfig) -> None:
         self.adjacency_map = self._build_adjacency(config)
         self.indoor_latched: set[str] = set()
@@ -54,12 +46,18 @@ class MapOccupancyResolver:
         timestamp: float,
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
+        area_ids: Iterable[str] | None = None,
     ) -> list[str]:
         """Explicitly clear indoor latches without rejecting active sensors."""
         active_areas = self._compute_sensor_active_areas(sensors)
+        targets = (
+            set(self.indoor_latched)
+            if area_ids is None
+            else self.indoor_latched.intersection(area_ids)
+        )
         cleared: list[str] = []
 
-        for area_id in sorted(self.indoor_latched):
+        for area_id in sorted(targets):
             if area_id in active_areas:
                 continue
             self.indoor_latched.remove(area_id)
@@ -421,9 +419,13 @@ class MapOccupancyResolver:
             if area_id in areas and areas[area_id].is_indoors
         )
 
-        self._report_unexpected_active_areas(
-            timestamp, areas, sensors, anomaly_detector
-        )
+        if anomaly_detector:
+            anomaly_detector.report_unexpected_active_areas(
+                timestamp,
+                areas,
+                sensors,
+                self._first_activation_time,
+            )
 
         final_occupied = sensor_active_areas | self.indoor_latched
 
@@ -438,130 +440,3 @@ class MapOccupancyResolver:
                 occ,
                 self.indoor_latched,
             )
-
-    # ------------------------------------------------------------------
-    # Positive-evidence diagnostics
-    # ------------------------------------------------------------------
-
-    def _report_unexpected_active_areas(
-        self,
-        timestamp: float,
-        areas: Dict[str, AreaState],
-        sensors: Dict[str, SensorState],
-        anomaly_detector: Optional[AnomalyDetector] = None,
-    ) -> None:
-        for area_id, area in areas.items():
-            is_sensor_on = self._is_area_active(area_id, sensors)
-
-            if not is_sensor_on:
-                continue
-
-            if not self._has_plausible_source(area_id, timestamp, areas, sensors):
-                if anomaly_detector:
-                    anomaly_detector.record_unexpected_activation(
-                        area_id, None, timestamp, context="no_plausible_source"
-                    )
-
-    def _has_plausible_source(
-        self,
-        area_id: str,
-        timestamp: float,
-        areas: Dict[str, AreaState],
-        sensors: Dict[str, SensorState],
-    ) -> bool:
-        area = areas[area_id]
-
-        # Exit-capable areas can always have new arrivals
-        if area.is_exit_capable:
-            return True
-
-        # With no neighbors, this area's own sensor is the only possible source.
-        if not self.adjacency_map.get(area_id):
-            return True
-
-        # Already occupied.
-        if area.occupied:
-            return True
-
-        # Recently occupied: if this area was occupied within 5 minutes,
-        # it's a known-active area, not a phantom. Accept re-activation
-        # immediately (e.g., after displacement during sensor OFF gap).
-        if (
-            area.last_occupied_at > 0
-            and (timestamp - area.last_occupied_at) <= self.RECENTLY_OCCUPIED_WINDOW
-        ):
-            return True
-
-        # Check adjacent areas
-        for neighbor_id in self.adjacency_map.get(area_id, []):
-            neighbor = areas.get(neighbor_id)
-            if not neighbor:
-                continue
-
-            if self._is_area_active(neighbor_id, sensors):
-                return True
-
-            if (
-                neighbor.last_motion > 0
-                and (timestamp - neighbor.last_motion) <= self.PLAUSIBLE_SOURCE_WINDOW
-            ):
-                return True
-
-            if neighbor.occupied:
-                return True
-
-            if (
-                neighbor.last_occupied_at > 0
-                and (timestamp - neighbor.last_occupied_at)
-                <= self.RECENTLY_OCCUPIED_WINDOW
-            ):
-                return True
-
-        # Check magnetic evidence
-        for sensor_state in sensors.values():
-            if sensor_state.config.get("type", "") not in MAGNETIC_SENSOR_TYPES:
-                continue
-            if area_id not in sensor_state.area_ids:
-                continue
-            if sensor_state.last_changed and sensor_state.last_changed >= (
-                timestamp - self.OUTDOOR_INTRUSION_WINDOW
-            ):
-                return True
-
-        # Bootstrap: accept indoor activations during the startup window.
-        # Room occupancy is deliberately not capped by an estimated number
-        # of people; several sensors may legitimately represent one person.
-        if self._first_activation_time == 0.0 and self.adjacency_map.get(area_id):
-            return True
-
-        if (
-            self._first_activation_time > 0
-            and (timestamp - self._first_activation_time) <= self.BOOTSTRAP_WINDOW
-            and area.is_indoors
-            and self.adjacency_map.get(area_id)
-        ):
-            return True
-
-        # Persistent activation: if this area's sensor has been cycling
-        # ON/OFF repeatedly, it's a real person, not a phantom.
-        # Phantoms fire once or twice. A person sitting causes 5+ cycles.
-        if area.is_indoors and self.adjacency_map.get(area_id):
-            recent_activations = 0
-            for s in sensors.values():
-                s_type = s.config.get("type", "")
-                if s_type not in MOTION_SENSOR_TYPES:
-                    continue
-                if area_id not in s.area_ids:
-                    continue
-                # Count ON events in history within the last 5 minutes
-                for item in s.history:
-                    if item.state and (timestamp - item.timestamp) <= 300:
-                        recent_activations += 1
-            if recent_activations >= 2:
-                _LOGGER.info(
-                    f"Persistent activation in {area_id}: "
-                    f"{recent_activations} activations in 5min, accepting"
-                )
-                return True
-
-        return False

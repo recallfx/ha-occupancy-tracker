@@ -7,11 +7,12 @@ A conservative Home Assistant integration for room occupancy tracking with unrel
 - **Pessimistic Indoor Occupancy**: Positive evidence is retained through sleep, sensor OFF gaps, and ambiguous movement
 - **Multi-Area Support**: Every configured area of an active motion/person sensor is marked occupied
 - **Freshness Score**: Time-since-motion scoring for diagnostics, never for indoor clearing
+- **Short-Lived Activity**: A separate two-minute signal for recent room activity
 - **Multiple Occupants**: Movement by one person cannot clear a room where another may remain
 - **Live Outdoor State**: Outdoor occupancy follows current trusted sensor evidence
 - **Flexible Sensors**: Motion, magnetic (door/window), and camera detection
 - **Anomaly Detection**: Alerts for stuck sensors and unusual patterns
-- **Explicit Cleanup**: A button clears stale indoor latches while preserving active sensor evidence
+- **Explicit Cleanup**: Clear all stale latches with a button or one room with a service
 - **Restart Persistence**: Quiet occupied rooms survive Home Assistant restarts
 
 ## Quick Start
@@ -115,8 +116,15 @@ sensors:
 
 ## Entities Created
 
-For each configured area, the integration creates an occupancy binary sensor.
-Its attributes include the boolean-compatible occupancy count, `evidence_state`
+For each configured area, the integration creates two binary sensors:
+
+- `binary_sensor.<area>_occupancy` is the durable safety signal. It answers
+  whether someone could still be present.
+- `binary_sensor.<area>_activity` is ON while a trusted configured sensor is ON
+  or for two minutes after the latest recorded activity. It may turn OFF while
+  someone is sitting still or sleeping and never clears occupancy.
+
+Occupancy attributes include the boolean-compatible count, `evidence_state`
 (`active`, `stale`, `inferred`, or `vacant`), active sensor IDs, freshness,
 last positive evidence, stale time, and explicit clear reason. `probability`
 remains as a compatibility alias for `freshness`.
@@ -125,7 +133,18 @@ System-wide entities:
 
 - `sensor.detected_anomalies` - Active anomaly count and details
 - `button.reset_anomalies` - Clear anomaly state
-- `button.clear_stale_occupancy` - Explicitly clear stale indoor occupancy
+- `button.clear_stale_occupancy` - Explicitly clear all stale indoor occupancy
+
+To clear only one known-stale room without affecting any other room:
+
+```yaml
+action: occupancy_tracker.clear_stale_occupancy
+data:
+  area_id: living_room
+```
+
+The service refuses to clear a room while one of its trusted configured
+sensors is currently ON.
 
 ## How It Works
 
@@ -135,15 +154,16 @@ The system uses a conservative event-driven state machine:
 2. **Motion cleared (OFF)** → Updates freshness but does not claim the indoor room is vacant.
 3. **Movement elsewhere** → Updates diagnostics without clearing previously possible indoor occupancy.
 4. **Freshness decay** → The score drops over time, but cannot clear indoor occupancy.
-5. **Explicit cleanup** → Clears only stale indoor latches; currently active sensors remain occupied.
-6. **Anomaly alerts** → Flags unexpected movement, stuck sensors, extended occupancy, and stale-looking state without changing occupancy.
+5. **Activity timeout** → The separate activity entity turns OFF after two quiet minutes; occupancy is unchanged.
+6. **Explicit cleanup** → Clears all stale latches with the button or one stale room with the service; currently active sensors remain occupied.
+7. **Anomaly alerts** → Flags unexpected movement, stuck sensors, extended occupancy, and stale-looking state without changing occupancy.
 
 The indoor latch is stored in Home Assistant's versioned storage. It is restored before current sensor baselines, so an initial PIR OFF state cannot erase a quiet occupied room.
 
 Do not use the durable occupancy entity as an automatic lights-off signal: by
 design it may remain ON after motion stops. Use the room's raw motion sensors
-for lighting timeouts; use occupancy for the safety question "could someone
-still be here?"
+or the activity entity for convenience automation; use occupancy for the
+safety question "could someone still be here?"
 
 For technical details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -156,7 +176,8 @@ For technical details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Occupancy stuck?**
 - Look for stuck sensor warnings
-- Use **Clear Stale Occupancy** when conservative state is no longer useful
+- Use the per-room service when only one latch is known to be stale
+- Use **Clear Stale Occupancy** when all conservative state is no longer useful
 
 **Erratic behavior?**
 - Review your adjacency map (are all connections defined?)

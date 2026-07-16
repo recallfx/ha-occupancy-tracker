@@ -164,6 +164,30 @@ class TestAsyncSetup:
         await after_clear.async_restore_occupancy()
         assert after_clear.get_occupancy("living_room") == 0
 
+    async def test_clear_stale_occupancy_service_targets_one_room(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """The service clears only the room explicitly asserted empty."""
+        await async_setup(hass, sample_config)
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        timestamp = time.time()
+        for sensor_id in (
+            "binary_sensor.motion_living",
+            "binary_sensor.motion_kitchen",
+        ):
+            coordinator.process_sensor_event(sensor_id, True, timestamp)
+            coordinator.process_sensor_event(sensor_id, False, timestamp + 1)
+
+        await hass.services.async_call(
+            DOMAIN,
+            "clear_stale_occupancy",
+            {"area_id": "living_room"},
+            blocking=True,
+        )
+
+        assert coordinator.get_occupancy("living_room") == 0
+        assert coordinator.get_occupancy("kitchen") == 1
+
     async def test_setup_seeds_current_on_multi_area_motion_sensor(
         self, hass: HomeAssistant, sample_config
     ):

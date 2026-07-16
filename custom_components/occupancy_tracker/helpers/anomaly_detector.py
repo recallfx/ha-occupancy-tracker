@@ -14,6 +14,11 @@ logger = logging.getLogger("anomaly_detector")
 class AnomalyDetector:
     """Detects anomalies in sensor readings and occupancy patterns."""
 
+    PLAUSIBLE_SOURCE_WINDOW = 10.0
+    OUTDOOR_INTRUSION_WINDOW = 300.0
+    BOOTSTRAP_WINDOW = 120.0
+    RECENTLY_OCCUPIED_WINDOW = 300.0
+
     def __init__(self, config: OccupancyTrackerConfig):
         self.config = config
         self.warnings: List[Warning] = []
@@ -286,6 +291,112 @@ class AnomalyDetector:
             area=area_id,
             sensor_id=sensor_id,
             timestamp=timestamp,
+        )
+
+    def report_unexpected_active_areas(
+        self,
+        timestamp: float,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+        first_activation_time: float,
+    ) -> None:
+        """Report active rooms that lack a plausible adjacent source."""
+        for area_id in areas:
+            if not self._is_area_active(area_id, sensors):
+                continue
+            if not self._has_plausible_source(
+                area_id, timestamp, areas, sensors, first_activation_time
+            ):
+                self.record_unexpected_activation(
+                    area_id, None, timestamp, context="no_plausible_source"
+                )
+
+    def _has_plausible_source(
+        self,
+        area_id: str,
+        timestamp: float,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+        first_activation_time: float,
+    ) -> bool:
+        area = areas[area_id]
+
+        if area.is_exit_capable or not self.adjacency_map.get(area_id):
+            return True
+
+        if area.occupied:
+            return True
+
+        if (
+            area.last_occupied_at > 0
+            and (timestamp - area.last_occupied_at) <= self.RECENTLY_OCCUPIED_WINDOW
+        ):
+            return True
+
+        for neighbor_id in self.adjacency_map.get(area_id, []):
+            neighbor = areas.get(neighbor_id)
+            if not neighbor:
+                continue
+            if self._is_area_active(neighbor_id, sensors) or neighbor.occupied:
+                return True
+            if (
+                neighbor.last_motion > 0
+                and (timestamp - neighbor.last_motion) <= self.PLAUSIBLE_SOURCE_WINDOW
+            ):
+                return True
+            if (
+                neighbor.last_occupied_at > 0
+                and (timestamp - neighbor.last_occupied_at)
+                <= self.RECENTLY_OCCUPIED_WINDOW
+            ):
+                return True
+
+        for sensor in sensors.values():
+            if sensor.config.get("type", "") not in MAGNETIC_SENSOR_TYPES:
+                continue
+            if area_id not in sensor.area_ids:
+                continue
+            if sensor.last_changed and sensor.last_changed >= (
+                timestamp - self.OUTDOOR_INTRUSION_WINDOW
+            ):
+                return True
+
+        if first_activation_time == 0.0 and self.adjacency_map.get(area_id):
+            return True
+        if (
+            first_activation_time > 0
+            and (timestamp - first_activation_time) <= self.BOOTSTRAP_WINDOW
+            and area.is_indoors
+            and self.adjacency_map.get(area_id)
+        ):
+            return True
+
+        if area.is_indoors and self.adjacency_map.get(area_id):
+            recent_activations = sum(
+                1
+                for sensor in sensors.values()
+                if sensor.config.get("type", "") in MOTION_SENSOR_TYPES
+                and area_id in sensor.area_ids
+                for item in sensor.history
+                if item.state and (timestamp - item.timestamp) <= 300
+            )
+            if recent_activations >= 2:
+                logger.info(
+                    "Persistent activation in %s: %d activations in 5min, accepting",
+                    area_id,
+                    recent_activations,
+                )
+                return True
+
+        return False
+
+    @staticmethod
+    def _is_area_active(area_id: str, sensors: Dict[str, SensorState]) -> bool:
+        return any(
+            sensor.is_trusted_active
+            and sensor.config.get("type", "") in MOTION_SENSOR_TYPES
+            and area_id in sensor.area_ids
+            for sensor in sensors.values()
         )
 
     def resolve_warning(self, warning_id: str) -> bool:

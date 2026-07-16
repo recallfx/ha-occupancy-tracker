@@ -27,6 +27,12 @@ The final occupied set is simply the union of current trusted active areas and
 conservative indoor latches. Adjacency is diagnostic only; there are no cluster
 leaders, movement caps, or inferred departures in the occupancy decision.
 
+Each area also exposes a non-authoritative `Activity` binary sensor. It is ON
+while trusted live evidence exists or for 120 seconds after recorded activity.
+It may turn OFF while a person is still present, so it is never an input to the
+durable occupancy decision. The periodic refresh is one minute, which means a
+quiet activity entity can remain ON for up to roughly one extra minute.
+
 ## Event flow
 
 1. Home Assistant reports a configured sensor state change.
@@ -57,9 +63,12 @@ Outdoor occupancy ends when its trusted live sensor evidence ends.
 
 ## Explicit cleanup
 
-The **Clear Stale Occupancy** button calls `clear_stale_indoor_occupancy`.
+The **Clear Stale Occupancy** button calls `clear_stale_indoor_occupancy` for
+every latched area. The `occupancy_tracker.clear_stale_occupancy` service
+requires an `area_id` and targets only that room.
 
-It clears only indoor latches whose trusted sensors are currently OFF. Areas with positive sensor evidence remain occupied even during manual cleanup.
+Both paths clear only indoor latches whose trusted sensors are currently OFF.
+Areas with positive sensor evidence remain occupied during manual cleanup.
 
 ## Evidence diagnostics
 
@@ -92,16 +101,19 @@ An initial OFF state does not clear restored occupancy. A current trusted ON sta
 
 ## Lighting boundary
 
-Durable occupancy and short-lived lighting activity are different signals.
-Automatic lighting must use raw motion sensors (or a separate activity signal)
-for its OFF timeout. The occupancy entity answers whether someone could still
-be present and therefore deliberately may not emit an automatic OFF edge.
+Durable occupancy and short-lived activity answer different questions.
+Automatic lighting must use raw motion sensors or the `Activity` entity for its
+OFF timeout. The occupancy entity answers whether someone could still be
+present and therefore deliberately may not emit an automatic OFF edge. The
+current motion-light configuration continues to use raw PIR signals.
 
 ## Main components
 
 - `coordinator.py`: sensor ingestion, periodic checks, entity updates, and explicit cleanup.
-- `helpers/map_occupancy_resolver.py`: trusted live evidence, indoor latch, and adjacency warnings.
-- `helpers/anomaly_detector.py`: read-only warnings.
+- `helpers/map_occupancy_resolver.py`: trusted live evidence and indoor latch.
+- `helpers/anomaly_detector.py`: read-only warnings and adjacency plausibility.
+- `helpers/history_verifier.py`: deterministic replay verification and live-state preservation.
+- `sensors/area_sensors.py`: durable occupancy and short-lived activity entities.
 - `helpers/area_state.py`: boolean area state.
 - `helpers/sensor_state.py`: sensor trust, availability, and history.
 - `helpers/map_state_recorder.py`: in-memory event snapshots and replay.
@@ -116,3 +128,5 @@ Tests must preserve these rules:
 4. Unexplained motion warns but is not rejected.
 5. Sensor OFF, neighbor motion, departure trails, and timeouts cannot clear indoor occupancy.
 6. Manual cleanup clears stale latches but preserves active sensor evidence.
+7. Activity expiration cannot clear occupancy.
+8. Targeted cleanup cannot clear any room other than the requested area.
