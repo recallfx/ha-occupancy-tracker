@@ -105,6 +105,22 @@ class TestSensorState:
         assert sensor.current_state is True
         assert len(sensor.history) == 3
 
+    def test_reset_clears_all_runtime_timestamps_and_history(self):
+        """A full reset must not leave stale transition metadata behind."""
+        timestamp = time.time()
+        sensor = SensorState("sensor.motion_1", {}, timestamp)
+        sensor.update_state(True, timestamp + 1)
+        sensor.mark_unavailable(timestamp + 2)
+
+        sensor.reset()
+
+        assert sensor.current_state is False
+        assert sensor.last_changed == 0
+        assert sensor.activated_at is None
+        assert sensor.last_update_time == 0
+        assert sensor.history == []
+        assert sensor.is_available is True
+
     def test_history_max_length(self):
         """Test that sensor history maintains max length."""
         from custom_components.occupancy_tracker.helpers.constants import (

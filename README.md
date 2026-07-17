@@ -1,17 +1,19 @@
 # Occupancy Tracker [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge)](https://github.com/hacs/integration)
 
-A sophisticated Home Assistant integration for reliable room presence detection using probabilistic state tracking and anomaly detection.
+A conservative Home Assistant integration for room occupancy tracking with unreliable motion sensors.
 
 ## Features
 
-- **Smart Occupancy Tracking**: Maintains accurate room presence even during sleep or sedentary activities
-- **Multi-Area Support**: Track occupancy across interconnected rooms with adjacency validation
-- **Probability Confidence**: Dynamic scoring that decays over time (100% → 10% over 1 hour)
-- **Multiple Occupants**: Handles families and multi-person scenarios
-- **Exit Detection**: Automatic clearing for areas where people can leave the system (front door, backyard)
+- **Pessimistic Indoor Occupancy**: Positive evidence is retained through sleep, sensor OFF gaps, and ambiguous movement
+- **Multi-Area Support**: Every configured area of an active motion/person sensor is marked occupied
+- **Freshness Score**: Time-since-motion scoring for diagnostics, never for indoor clearing
+- **Short-Lived Activity**: A separate two-minute signal for recent room activity
+- **Multiple Occupants**: Movement by one person cannot clear a room where another may remain
+- **Live Outdoor State**: Outdoor occupancy follows current trusted sensor evidence
 - **Flexible Sensors**: Motion, magnetic (door/window), and camera detection
 - **Anomaly Detection**: Alerts for stuck sensors and unusual patterns
-- **Crash Recovery**: Rebuilds state from event history after restarts
+- **Explicit Cleanup**: Clear all stale latches with a button or one room with a service
+- **Restart Persistence**: Quiet occupied rooms survive Home Assistant restarts
 
 ## Quick Start
 
@@ -75,7 +77,8 @@ areas:
     exit_capable: false  # Optional: set true for entry/exit points
 ```
 
-**Exit-capable areas** (front door, backyard, etc.) clear occupancy immediately when motion stops, unless movement to a neighbor is detected. They also have a 5-minute auto-clear fallback.
+Indoor areas remain conservative even if they are marked `exit_capable`.
+Outdoor areas are not latched and return vacant when trusted live evidence ends.
 
 ### Adjacency Map
 
@@ -113,26 +116,54 @@ sensors:
 
 ## Entities Created
 
-For each configured area, the integration creates:
+For each configured area, the integration creates two binary sensors:
 
-- `binary_sensor.occupancy_tracker_{area_id}` - ON when occupied
-- `sensor.occupancy_tracker_{area_id}_probability` - Confidence score (0.0-1.0)
+- `binary_sensor.<area>_occupancy` is the durable safety signal. It answers
+  whether someone could still be present.
+- `binary_sensor.<area>_activity` is ON while a trusted configured sensor is ON
+  or for two minutes after the latest recorded activity. It may turn OFF while
+  someone is sitting still or sleeping and never clears occupancy.
+
+Occupancy attributes include the boolean-compatible count, `evidence_state`
+(`active`, `stale`, `inferred`, or `vacant`), active sensor IDs, freshness,
+last positive evidence, stale time, and explicit clear reason. `probability`
+remains as a compatibility alias for `freshness`.
 
 System-wide entities:
 
-- `sensor.occupancy_tracker_warnings` - Active anomaly alerts
-- `button.occupancy_tracker_reset_warnings` - Clear warnings
-- `button.occupancy_tracker_reset_system` - Full system reset
+- `sensor.detected_anomalies` - Active anomaly count and details
+- `button.reset_anomalies` - Clear anomaly state
+- `button.clear_stale_occupancy` - Explicitly clear all stale indoor occupancy
+
+To clear only one known-stale room without affecting any other room:
+
+```yaml
+action: occupancy_tracker.clear_stale_occupancy
+data:
+  area_id: living_room
+```
+
+The service refuses to clear a room while one of its trusted configured
+sensors is currently ON.
 
 ## How It Works
 
-The system uses an event-driven probabilistic state machine:
+The system uses a conservative event-driven state machine:
 
 1. **Motion detected (ON)** → Marks area occupied immediately. Checks adjacent rooms for a "plausible source" (occupancy or active motion) and flags anomalies if none found.
-2. **Motion cleared (OFF)** → Checks if an adjacent room activated *after* this room turned ON. If so, moves the occupant to the neighbor. If not, the person is assumed to have stayed.
-3. **Confidence decay** → Probability drops over time without motion (100% → 10% over 1 hour), but occupancy remains until movement is detected.
-4. **Exit detection** → Clears exit-capable areas (front door, backyard) immediately when motion stops (with a 5-minute auto-clear fallback).
-5. **Anomaly alerts** → Flags impossible movements, stuck sensors, or extended occupancy (12h+).
+2. **Motion cleared (OFF)** → Updates freshness but does not claim the indoor room is vacant.
+3. **Movement elsewhere** → Updates diagnostics without clearing previously possible indoor occupancy.
+4. **Freshness decay** → The score drops over time, but cannot clear indoor occupancy.
+5. **Activity timeout** → The separate activity entity turns OFF after two quiet minutes; occupancy is unchanged.
+6. **Explicit cleanup** → Clears all stale latches with the button or one stale room with the service; currently active sensors remain occupied.
+7. **Anomaly alerts** → Flags unexpected movement, stuck sensors, extended occupancy, and stale-looking state without changing occupancy.
+
+The indoor latch is stored in Home Assistant's versioned storage. It is restored before current sensor baselines, so an initial PIR OFF state cannot erase a quiet occupied room.
+
+Do not use the durable occupancy entity as an automatic lights-off signal: by
+design it may remain ON after motion stops. Use the room's raw motion sensors
+or the activity entity for convenience automation; use occupancy for the
+safety question "could someone still be here?"
 
 For technical details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -145,8 +176,8 @@ For technical details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Occupancy stuck?**
 - Look for stuck sensor warnings
-- Check if the area is exit-capable (should auto-clear after 5 min)
-- Use the reset button to clear stale state
+- Use the per-room service when only one latch is known to be stale
+- Use **Clear Stale Occupancy** when all conservative state is no longer useful
 
 **Erratic behavior?**
 - Review your adjacency map (are all connections defined?)

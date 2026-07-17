@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock
 from homeassistant.core import HomeAssistant
 from custom_components.occupancy_tracker.sensors import (
     AnomalySensor,
+    AreaActivityBinarySensor,
     AreaOccupancyBinarySensor,
 )
 from custom_components.occupancy_tracker.sensor import (
@@ -37,9 +38,14 @@ def coordinator():
             "porch": {"name": "Porch", "indoors": False},
         },
         "adjacency": {},
-        "sensors": {},
+        "sensors": {
+            "binary_sensor.living_room_motion": {
+                "area": "living_room",
+                "type": "motion",
+            }
+        },
     }
-    return OccupancyCoordinator(hass, config)
+    return OccupancyCoordinator(hass, config, store=Mock())
 
 
 class TestAreaOccupancyBinarySensor:
@@ -77,14 +83,46 @@ class TestAreaOccupancyBinarySensor:
         assert attrs["occupancy_count"] == 1
 
     def test_attributes_include_probability(self, coordinator):
-        """Test attributes include probability."""
+        """Test attributes expose freshness with a compatibility alias."""
         _set_occupancy(coordinator.areas["living_room"], 1)
         coordinator.areas["living_room"].record_motion(time.time())
 
         sensor = AreaOccupancyBinarySensor(coordinator, "living_room")
         attrs = sensor.extra_state_attributes
 
+        assert attrs["freshness"] == 1.0
         assert attrs["probability"] == 1.0
+
+    def test_attributes_explain_occupancy_evidence(self, coordinator):
+        """Area attributes distinguish live evidence from a stale latch."""
+        area = coordinator.areas["living_room"]
+        sensor_state = coordinator.sensors["binary_sensor.living_room_motion"]
+        sensor = AreaOccupancyBinarySensor(coordinator, "living_room")
+
+        area.occupied = True
+        area.record_motion(1000.0)
+        sensor_state.current_state = True
+        assert sensor.extra_state_attributes["evidence_state"] == "active"
+        assert sensor.extra_state_attributes["active_sensors"] == [
+            "binary_sensor.living_room_motion"
+        ]
+
+        sensor_state.current_state = False
+        area.stale_since = 1010.0
+        coordinator.occupancy_resolver.indoor_latched.add("living_room")
+        attrs = sensor.extra_state_attributes
+        assert attrs["evidence_state"] == "stale"
+        assert attrs["last_positive_evidence"] == 1000.0
+        assert attrs["stale_since"] == 1010.0
+
+    def test_attributes_explain_inferred_and_vacant_states(self, coordinator):
+        """Non-latched occupancy remains visibly distinct from vacancy."""
+        sensor = AreaOccupancyBinarySensor(coordinator, "porch")
+
+        assert sensor.extra_state_attributes["evidence_state"] == "vacant"
+
+        coordinator.areas["porch"].occupied = True
+        assert sensor.extra_state_attributes["evidence_state"] == "inferred"
 
     def test_attributes_include_area_properties(self, coordinator):
         """Test attributes include indoors and exit_capable."""
@@ -107,6 +145,57 @@ class TestAreaOccupancyBinarySensor:
         sensor = AreaOccupancyBinarySensor(coordinator, "living_room")
 
         assert sensor.device_class == "occupancy"
+
+
+class TestAreaActivityBinarySensor:
+    """Test the short-lived, non-authoritative activity signal."""
+
+    def test_recent_activity_expires_without_clearing_safe_occupancy(self, coordinator):
+        area = coordinator.areas["living_room"]
+        area.record_motion(1000.0)
+        area.occupied = True
+        coordinator.occupancy_resolver.indoor_latched.add("living_room")
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                "custom_components.occupancy_tracker.sensors.area_sensors.time.time",
+                lambda: 1119.0,
+            )
+            assert sensor.is_on is True
+            assert sensor.extra_state_attributes["activity_source"] == "recent"
+
+            monkeypatch.setattr(
+                "custom_components.occupancy_tracker.sensors.area_sensors.time.time",
+                lambda: 1121.0,
+            )
+            assert sensor.is_on is False
+
+        assert coordinator.get_occupancy("living_room") == 1
+
+    def test_live_trusted_sensor_is_activity_even_with_old_timestamp(self, coordinator):
+        sensor_state = coordinator.sensors["binary_sensor.living_room_motion"]
+        sensor_state.current_state = True
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        assert sensor.is_on is True
+        assert sensor.extra_state_attributes["activity_source"] == "live"
+
+    def test_unavailable_sensor_is_not_live_activity(self, coordinator):
+        sensor_state = coordinator.sensors["binary_sensor.living_room_motion"]
+        sensor_state.current_state = True
+        sensor_state.mark_unavailable(time.time())
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        assert sensor.is_on is False
+        assert sensor.extra_state_attributes["activity_source"] == "none"
+
+    def test_identity_and_device_class(self, coordinator):
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        assert sensor._attr_name == "Living Room Activity"
+        assert sensor._attr_unique_id == "activity_living_room"
+        assert sensor.device_class == "motion"
 
 
 class TestAnomalySensor:
@@ -214,9 +303,10 @@ class TestAsyncSetupPlatforms:
         assert async_add_entities.called
         entities = async_add_entities.call_args[0][0]
 
-        # One binary sensor per area
-        assert len(entities) == 2
-        assert all(isinstance(e, AreaOccupancyBinarySensor) for e in entities)
+        # One safe-occupancy and one short-lived activity sensor per area.
+        assert len(entities) == 4
+        assert sum(isinstance(e, AreaOccupancyBinarySensor) for e in entities) == 2
+        assert sum(isinstance(e, AreaActivityBinarySensor) for e in entities) == 2
 
     async def test_sensor_platform(self, hass):
         """Test sensor platform creates only anomaly sensor."""

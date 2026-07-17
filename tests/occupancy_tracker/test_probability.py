@@ -22,7 +22,7 @@ def coordinator():
         "adjacency": {},
         "sensors": {},
     }
-    return OccupancyCoordinator(hass, config)
+    return OccupancyCoordinator(hass, config, store=Mock())
 
 
 def test_probability_decay(coordinator):
@@ -83,7 +83,21 @@ def test_unknown_area(coordinator):
     assert coordinator.get_occupancy_probability("unknown_area") == 0.0
 
 
-def test_check_timeouts_removes_phantom_from_resolver_retention():
+def test_default_coordinator_has_no_duplicate_periodic_loop(coordinator):
+    """The integration-owned 60-second timer is the only periodic loop."""
+    assert coordinator.update_interval is None
+
+
+def test_probability_is_a_compatibility_alias_for_freshness(coordinator):
+    area = coordinator.areas["living_room"]
+    area.record_entry(1000.0)
+    area.record_motion(1000.0)
+
+    assert coordinator.get_occupancy_freshness("living_room", 1061.0) == 0.9
+    assert coordinator.get_occupancy_probability("living_room", 1061.0) == 0.9
+
+
+def test_check_timeouts_keeps_uncertain_indoor_latch():
     hass = Mock(spec=HomeAssistant)
     now = 100000.0
     config = {
@@ -99,14 +113,14 @@ def test_check_timeouts_removes_phantom_from_resolver_retention():
             "sensor.hallway_motion": {"area": "hallway", "type": "motion"},
         },
     }
-    coordinator = OccupancyCoordinator(hass, config, enable_periodic_updates=False)
+    coordinator = OccupancyCoordinator(hass, config, store=Mock())
 
     _set_occupancy(coordinator.areas["bathroom"], 1)
     coordinator.areas["bathroom"].last_motion = now - 12000
     coordinator.areas["hallway"].last_motion = now - 3600
-    coordinator.occupancy_resolver.retained["bathroom"] = now - 12000
+    coordinator.occupancy_resolver.indoor_latched.add("bathroom")
 
     coordinator.check_timeouts(now)
 
-    assert coordinator.areas["bathroom"].occupancy == 0
-    assert "bathroom" not in coordinator.occupancy_resolver.retained
+    assert coordinator.areas["bathroom"].occupancy == 1
+    assert "bathroom" in coordinator.occupancy_resolver.indoor_latched

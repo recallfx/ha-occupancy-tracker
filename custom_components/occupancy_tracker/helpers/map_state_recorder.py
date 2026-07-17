@@ -98,6 +98,44 @@ class MapStateRecorder:
         self.last_event_snapshot_time = timestamp
         return snapshot
 
+    def record_clear_event(
+        self,
+        timestamp: float,
+        area_ids: list[str],
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> MapSnapshot:
+        """Record an explicit stale-occupancy cleanup for deterministic replay."""
+        snapshot = self._build_snapshot(
+            timestamp=timestamp,
+            event_type="clear",
+            description=f"clear:{','.join(sorted(area_ids))}",
+            areas=areas,
+            sensors=sensors,
+        )
+        self.last_snapshot_time = timestamp
+        self.last_event_snapshot_time = timestamp
+        return snapshot
+
+    def record_restore_event(
+        self,
+        timestamp: float,
+        area_ids: list[str],
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> MapSnapshot:
+        """Record restored persistent occupancy for deterministic replay."""
+        snapshot = self._build_snapshot(
+            timestamp=timestamp,
+            event_type="restore",
+            description=f"restore:{','.join(sorted(area_ids))}",
+            areas=areas,
+            sensors=sensors,
+        )
+        self.last_snapshot_time = timestamp
+        self.last_event_snapshot_time = timestamp
+        return snapshot
+
     def maybe_record_tick(
         self,
         timestamp: float,
@@ -183,6 +221,8 @@ class MapStateRecorder:
                 "occupancy": area.occupancy,
                 "is_occupied": area.is_occupied,
                 "last_motion": area.last_motion,
+                "stale_since": area.stale_since,
+                "cleared_by": area.cleared_by,
             }
         return payload
 

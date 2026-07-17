@@ -88,7 +88,9 @@ class SensorState:
     def reset(self) -> None:
         """Reset sensor state to initial values."""
         self.current_state = False
+        self.last_changed = 0
         self.activated_at = None
+        self.last_update_time = 0
         self.history = []
         self.is_available = True
         self.is_reliable = True

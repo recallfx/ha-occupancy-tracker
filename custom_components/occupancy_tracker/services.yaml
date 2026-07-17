@@ -1,0 +1,11 @@
+clear_stale_occupancy:
+  name: Clear stale room occupancy
+  description: Clear one room only when you know nobody is physically there.
+  fields:
+    area_id:
+      name: Occupancy area ID
+      description: The configured occupancy_tracker area to clear.
+      required: true
+      example: study
+      selector:
+        text:

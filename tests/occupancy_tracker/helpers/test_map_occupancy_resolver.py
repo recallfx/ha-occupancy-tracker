@@ -58,8 +58,8 @@ def test_unavailable_on_sensor_is_not_active_evidence():
 # ============================================================
 
 
-def test_transfer_on_on_basic():
-    """Motion-ON in destination pulls claim from occupied adjacent source."""
+def test_motion_on_does_not_clear_adjacent_source():
+    """Destination motion is additive because another person may remain."""
     now = time.time()
     config = {
         "areas": {
@@ -85,14 +85,14 @@ def test_transfer_on_on_basic():
     assert areas["area_a"].occupancy == 1
     assert areas["area_b"].occupancy == 0
 
-    # Person walks to area_b: motion-ON in area_b pulls claim from area_a
+    # Person walks to area_b, but this cannot prove area_a is empty.
     _fire(resolver, sensors, areas, "s.b", True, now + 1)
-    assert areas["area_a"].occupancy == 0
+    assert areas["area_a"].occupancy == 1
     assert areas["area_b"].occupancy == 1
 
 
-def test_transfer_on_on_chain():
-    """Claims transfer through a chain of rooms on ON events."""
+def test_motion_chain_keeps_all_possible_rooms_occupied():
+    """A motion chain cannot prove that earlier rooms are empty."""
     now = time.time()
     config = {
         "areas": {
@@ -120,16 +120,17 @@ def test_transfer_on_on_chain():
     assert areas["a"].occupancy == 1
 
     _fire(resolver, sensors, areas, "s.b", True, now + 1)
-    assert areas["a"].occupancy == 0
+    assert areas["a"].occupancy == 1
     assert areas["b"].occupancy == 1
 
     _fire(resolver, sensors, areas, "s.c", True, now + 2)
-    assert areas["b"].occupancy == 0
+    assert areas["a"].occupancy == 1
+    assert areas["b"].occupancy == 1
     assert areas["c"].occupancy == 1
 
 
-def test_motion_off_noop_after_transfer():
-    """Motion-OFF in source is a no-op when claim was already transferred on ON."""
+def test_motion_off_does_not_clear_possible_occupancy():
+    """A sensor OFF edge means no motion, not an empty room."""
     now = time.time()
     config = {
         "areas": {
@@ -152,12 +153,12 @@ def test_motion_off_noop_after_transfer():
 
     _fire(resolver, sensors, areas, "s.a", True, now)
     _fire(resolver, sensors, areas, "s.b", True, now + 1)
-    assert areas["a"].occupancy == 0
+    assert areas["a"].occupancy == 1
     assert areas["b"].occupancy == 1
 
-    # OFF in area_a: no claims left -> no-op
+    # OFF in area_a cannot prove vacancy.
     _fire(resolver, sensors, areas, "s.a", False, now + 5)
-    assert areas["a"].occupancy == 0
+    assert areas["a"].occupancy == 1
     assert areas["b"].occupancy == 1
 
 
@@ -183,8 +184,8 @@ def test_exit_capable_new_entry():
     assert areas["entry"].occupancy == 1
 
 
-def test_exit_capable_clears_on_off():
-    """Exit-capable area clears claims when motion stops and no indoor neighbor is active."""
+def test_indoor_exit_capable_area_does_not_clear_on_off():
+    """Even an exit-capable indoor area may still contain someone."""
     now = time.time()
     config = {
         "areas": {
@@ -209,9 +210,9 @@ def test_exit_capable_clears_on_off():
     _fire(resolver, sensors, areas, "s.e", True, now)
     assert areas["entry"].occupancy == 1
 
-    # Motion stops, no indoor neighbor active -> person left
+    # Motion stops, but that is not proof the room is empty.
     _fire(resolver, sensors, areas, "s.e", False, now + 5)
-    assert areas["entry"].occupancy == 0
+    assert areas["entry"].occupancy == 1
 
 
 def test_exit_capable_does_not_clear_if_indoor_neighbor_active():
@@ -240,8 +241,8 @@ def test_exit_capable_does_not_clear_if_indoor_neighbor_active():
     # Hall becomes active (neighbor is active)
     _fire(resolver, sensors, areas, "s.h", True, now + 1)
 
-    # By now, entry's claim was transferred to hall via ON
-    assert areas["entry"].occupancy == 0
+    # Hall activity cannot prove that entry is empty.
+    assert areas["entry"].occupancy == 1
     assert areas["hall"].occupancy == 1
 
 
@@ -453,8 +454,8 @@ def test_convergence_sole_active_neighbor():
 # ============================================================
 
 
-def test_outdoor_to_indoor_transfer():
-    """Claim transfers from outdoor to indoor on motion-ON."""
+def test_outdoor_to_indoor_motion_keeps_active_sensor_occupied():
+    """An active outdoor sensor is not marked vacant during indoor motion."""
     now = time.time()
     config = {
         "areas": {
@@ -479,10 +480,31 @@ def test_outdoor_to_indoor_transfer():
     _fire(resolver, sensors, areas, "s.f", True, now)
     assert areas["frontyard"].occupancy == 1
 
-    # Entry motion ON -> transfer from frontyard
+    # Entry motion ON adds indoor evidence without rejecting active outdoor evidence.
     _fire(resolver, sensors, areas, "s.e", True, now + 2)
-    assert areas["frontyard"].occupancy == 0
+    assert areas["frontyard"].occupancy == 1
     assert areas["entry"].occupancy == 1
+
+
+def test_outdoor_occupancy_ends_when_live_evidence_ends():
+    """Outdoor detections are not conservatively latched or inferred."""
+    now = time.time()
+    config = {
+        "areas": {"porch": {"name": "Porch", "indoors": False}},
+        "adjacency": {},
+        "sensors": {},
+    }
+    resolver = MapOccupancyResolver(config)
+    areas = {"porch": AreaState("porch", config["areas"]["porch"])}
+    sensors = {
+        "s.porch": SensorState("s.porch", {"area": "porch", "type": "motion"}, now)
+    }
+
+    _fire(resolver, sensors, areas, "s.porch", True, now)
+    assert areas["porch"].occupancy == 1
+
+    _fire(resolver, sensors, areas, "s.porch", False, now + 5)
+    assert areas["porch"].occupancy == 0
 
 
 # ============================================================
@@ -516,9 +538,9 @@ def test_multi_sensor_same_room():
     _fire(resolver, sensors, areas, "s.pir", False, now + 5)
     assert areas["room"].occupancy == 1
 
-    # Camera off -> now all off, exit-capable clears
+    # Camera off is still not proof that an indoor room is empty.
     _fire(resolver, sensors, areas, "s.cam", False, now + 10)
-    assert areas["room"].occupancy == 0
+    assert areas["room"].occupancy == 1
 
 
 # ============================================================
@@ -526,8 +548,8 @@ def test_multi_sensor_same_room():
 # ============================================================
 
 
-def test_open_plan_rebalance():
-    """Open-plan group: motion in different member rebalances, doesn't inflate."""
+def test_open_plan_motion_keeps_all_possible_members_occupied():
+    """Open-plan clustering cannot clear a member with positive evidence."""
     now = time.time()
     config = {
         "areas": {
@@ -569,15 +591,15 @@ def test_open_plan_rebalance():
     # Dining sensor fires: same person, rebalance within group
     _fire(resolver, sensors, areas, "s.d", True, now + 2)
     assert areas["dining"].occupancy == 1
-    assert areas["kitchen"].occupancy == 0
+    assert areas["kitchen"].occupancy == 1
     total = sum(a.occupancy for a in areas.values())
-    assert total == 1  # No inflation
+    assert total == 3
 
     # Living sensor fires: rebalance again
     _fire(resolver, sensors, areas, "s.l", True, now + 3)
     assert areas["living"].occupancy == 1
     total = sum(a.occupancy for a in areas.values())
-    assert total == 1
+    assert total == 4
 
 
 def test_open_plan_exit_to_non_group_area():
@@ -623,10 +645,10 @@ def test_open_plan_exit_to_non_group_area():
     # Person leaves kitchen/dining area back to corridor
     _fire(resolver, sensors, areas, "s.c", False, now + 5)
     _fire(resolver, sensors, areas, "s.c", True, now + 10)
-    # Corridor pulls claim from dining (adjacent occupied indoor)
+    # Corridor activity does not clear the previously possible rooms.
     assert areas["corridor"].occupancy == 1
     total = sum(a.occupancy for a in areas.values())
-    assert total == 1
+    assert total == 4
 
 
 # ============================================================
@@ -661,10 +683,10 @@ def test_outdoor_evidence_allows_entry():
     _fire(resolver, sensors, areas, "s.fy", True, now, detector)
     assert areas["frontyard"].occupancy == 1
 
-    # Indoor motion -> transfer from outdoor occupied neighbor
+    # Indoor motion adds evidence; the still-ON outdoor sensor also remains occupied.
     _fire(resolver, sensors, areas, "s.f", True, now + 2, detector)
     assert areas["foyer"].occupancy == 1
-    assert areas["frontyard"].occupancy == 0
+    assert areas["frontyard"].occupancy == 1
 
 
 # ============================================================
@@ -779,22 +801,6 @@ def test_adjacency_bidirectional():
     assert "a" in resolver.adjacency_map["b"]
 
 
-def test_open_plan_groups_parsed():
-    """Open-plan groups are parsed from config."""
-    config = {
-        "areas": {"k": {}, "d": {}, "l": {}},
-        "adjacency": {},
-        "sensors": {},
-        "open_plan_groups": {
-            "main": {"areas": ["k", "d", "l"]},
-        },
-    }
-    resolver = MapOccupancyResolver(config)
-
-    assert resolver.open_plan_groups == {"main": ["k", "d", "l"]}
-    assert resolver.area_to_group == {"k": "main", "d": "main", "l": "main"}
-
-
 # ============================================================
 # Magnetic events
 # ============================================================
@@ -831,8 +837,8 @@ def test_magnetic_event_updates_last_motion():
 # ============================================================
 
 
-def test_full_walkthrough_entry_traverse_exit():
-    """Person enters, walks through house, and leaves."""
+def test_full_walkthrough_preserves_uncertain_room():
+    """A late neighboring activation does not erase retained occupancy."""
     now = time.time()
     config = {
         "areas": {
@@ -856,15 +862,15 @@ def test_full_walkthrough_entry_traverse_exit():
     _fire(resolver, sensors, areas, "s.e", True, now)
     assert areas["entry"].occupancy == 1
 
-    # Walk to hall (transfer on ON)
+    # Walk to hall; uncertainty about entry remains.
     _fire(resolver, sensors, areas, "s.h", True, now + 1)
     assert areas["hall"].occupancy == 1
-    assert areas["entry"].occupancy == 0
+    assert areas["entry"].occupancy == 1
 
     # Walk to kitchen
     _fire(resolver, sensors, areas, "s.k", True, now + 2)
     assert areas["kitchen"].occupancy == 1
-    assert areas["hall"].occupancy == 0
+    assert areas["hall"].occupancy == 1
 
     # Sit in kitchen, sensors turn off
     _fire(resolver, sensors, areas, "s.e", False, now + 5)
@@ -877,18 +883,20 @@ def test_full_walkthrough_entry_traverse_exit():
     # Walk back to hall
     _fire(resolver, sensors, areas, "s.h", True, now + 60)
     assert areas["hall"].occupancy == 1
-    assert areas["kitchen"].occupancy == 0
+    assert areas["kitchen"].occupancy == 1
 
     # Walk to entry
     _fire(resolver, sensors, areas, "s.e", True, now + 61)
     assert areas["entry"].occupancy == 1
-    assert areas["hall"].occupancy == 0
+    assert areas["hall"].occupancy == 1
 
     # Leave via entry
     _fire(resolver, sensors, areas, "s.h", False, now + 65)
     _fire(resolver, sensors, areas, "s.e", False, now + 66)
-    assert areas["entry"].occupancy == 0
+    assert areas["entry"].occupancy == 1
 
-    # Total: 0
+    # The exit clears, but the kitchen remains uncertain because its motion
+    # was not tightly coupled to the later hallway activation.
     total = sum(a.occupancy for a in areas.values())
-    assert total == 0
+    assert total == 3
+    assert areas["kitchen"].occupancy == 1

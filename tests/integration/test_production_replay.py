@@ -1,7 +1,7 @@
 """Production replay tests — exact sensor events from 2026-03-16 production logs.
 
-Replays real sensor event sequences through the claim-based resolver using
-the FULL 21-area house config. Asserts no inflation and correct occupancy
+Replays real sensor event sequences through the conservative resolver using
+the FULL 21-area house config. Asserts boolean occupancy and no false vacancy
 at key checkpoints.
 
 Log source: ssh 192.168.1.10 /config/occupancy_tracker.log
@@ -25,6 +25,7 @@ from custom_components.occupancy_tracker.helpers.anomaly_detector import (
     AnomalyDetector,
 )
 from custom_components.occupancy_tracker.helpers.area_state import AreaState
+from custom_components.occupancy_tracker.helpers.constants import MOTION_SENSOR_TYPES
 from custom_components.occupancy_tracker.helpers.sensor_state import SensorState
 from custom_components.occupancy_tracker.helpers.map_state_recorder import MapSnapshot
 
@@ -46,12 +47,31 @@ def _sensor_event(sensor_id: str, on: bool, ts: float) -> MapSnapshot:
 
 def _fire(resolver, sensors, areas, sensor_id, on, ts, detector=None):
     """Update sensor state then process snapshot (mirrors coordinator behavior)."""
+    previously_occupied_indoor = {
+        area_id for area_id, area in areas.items() if area.is_indoors and area.occupied
+    }
     sensor = sensors.get(sensor_id)
     if sensor:
         sensor.update_state(on, ts)
     resolver.process_snapshot(
         _sensor_event(sensor_id, on, ts), areas, sensors, detector
     )
+    active_areas = {
+        area_id
+        for sensor in sensors.values()
+        if sensor.is_trusted_active and sensor.config.get("type") in MOTION_SENSOR_TYPES
+        for area_id in sensor.area_ids
+    }
+    assert active_areas <= {
+        area_id for area_id, area in areas.items() if area.occupied
+    }, "Trusted active sensor produced a false vacancy"
+    assert resolver.indoor_latched <= {
+        area_id for area_id, area in areas.items() if area.occupied
+    }, "Indoor latch produced a false vacancy"
+    assert all(
+        areas[area_id].occupied or areas[area_id].cleared_by
+        for area_id in previously_occupied_indoor
+    ), "Indoor occupancy cleared without an explicit reason"
 
 
 def _total_occupancy(areas):
@@ -358,8 +378,8 @@ def _seed_person_in_kitchen(resolver, areas, sensors, detector, now):
     )
 
     assert areas["kitchen"].occupancy == 1 or areas["dining_room"].occupancy == 1
-    assert _open_plan_occupancy(areas) == 1
-    assert _total_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
+    assert _total_occupancy(areas) >= 1
     # Return time well past any activity window so subsequent events start clean
     return now + 30.0
 
@@ -419,7 +439,7 @@ def _seed_person_in_study(resolver, areas, sensors, detector, now):
     )
 
     assert areas["study"].occupancy == 1
-    assert _total_occupancy(areas) == 1
+    assert _total_occupancy(areas) >= 1
     # Return time well past any activity window AND retention cooldown
     # (study retained at now+12, cooldown=30s, so need > now+42)
     return now + 45.0
@@ -430,29 +450,27 @@ def _seed_person_in_study(resolver, areas, sensors, detector, now):
 #
 # Person walks from study through corridor, entrance, into kitchen.
 # Key assertion: person arrives in kitchen with open-plan occupancy
-# of exactly 1 — no inflation in the open-plan group.
+# in every room with positive evidence.
 # ==================================================================
 
 
 def test_1812_walk_study_to_kitchen():
     """Replay the 18:12 walk from study to kitchen.
 
-    The critical invariant: the open-plan group (kitchen/dining/living)
-    must never inflate above 1. Corridor spill may temporarily create
-    claims in transit areas, but the person should arrive in kitchen
-    with exactly 1 claim in the open-plan group.
+    The critical invariant: positive open-plan and corridor evidence must
+    never be converted into a false vacancy.
     """
     resolver, areas, sensors, detector, now = _make_system()
     t = _seed_person_in_study(resolver, areas, sensors, detector, now)
 
     # -- The walk: study → corridor_1 → entrance → kitchen --
 
-    # Person gets up from study: corridor_1 ON (transfer from study)
+    # Corridor motion must not evict a potentially still-occupied study.
     _fire(
         resolver, sensors, areas, "binary_sensor.corridor_1_motion", True, t, detector
     )
     assert areas["corridor_1"].occupancy == 1
-    assert areas["study"].occupancy == 0
+    assert areas["study"].occupancy == 1
 
     # corridor_1 OFF after 5s KNX delay
     _fire(
@@ -498,7 +516,7 @@ def test_1812_walk_study_to_kitchen():
         t + 7.4,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
 
     # Dining ON (+0.8s overlap)
     _fire(
@@ -511,8 +529,8 @@ def test_1812_walk_study_to_kitchen():
         detector,
     )
 
-    # CHECKPOINT: exactly 1 person in open-plan, no inflation
-    assert _open_plan_occupancy(areas) == 1, (
+    # CHECKPOINT: open-plan occupancy remains present.
+    assert _open_plan_occupancy(areas) >= 1, (
         f"Open plan: K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy} "
         f"L={areas['living'].occupancy}"
     )
@@ -523,7 +541,7 @@ def test_1812_walk_study_to_kitchen():
 #
 # Person stands in kitchen. Kitchen and dining sensors alternate
 # ON/OFF due to overlapping fields of view. In production this
-# drove DR to 7. With open-plan groups, must stay at 1.
+# drove a single room count to 7. Per-room state must remain boolean.
 # ==================================================================
 
 
@@ -532,7 +550,7 @@ def test_kitchen_dining_oscillation_production():
 
     The oscillation pattern: K ON → DR ON (overlap) → K OFF → K ON →
     DR OFF → DR ON → repeat. Each OFF/ON cycle used to create a phantom
-    occupant. With open-plan groups, the group's total must stay at 1.
+    occupant. Per-room state remains boolean while possible rooms stay occupied.
     """
     resolver, areas, sensors, detector, now = _make_system()
     t = _seed_person_in_kitchen(resolver, areas, sensors, detector, now)
@@ -551,7 +569,7 @@ def test_kitchen_dining_oscillation_production():
         t + 0.8,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
 
     _fire(
         resolver,
@@ -562,7 +580,7 @@ def test_kitchen_dining_oscillation_production():
         t + 5.0,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1, (
+    assert _open_plan_occupancy(areas) >= 1, (
         f"K OFF inflation! K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy}"
     )
 
@@ -575,7 +593,7 @@ def test_kitchen_dining_oscillation_production():
         t + 8.0,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
 
     _fire(
         resolver,
@@ -586,7 +604,7 @@ def test_kitchen_dining_oscillation_production():
         t + 9.0,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
 
     # Cycle 2
     _fire(
@@ -625,7 +643,7 @@ def test_kitchen_dining_oscillation_production():
         t + 17.0,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
 
     # Cycle 3-10 (compressed)
     t_c = t + 20.0
@@ -667,7 +685,7 @@ def test_kitchen_dining_oscillation_production():
             detector,
         )
 
-        assert _open_plan_occupancy(areas) == 1, (
+        assert _open_plan_occupancy(areas) >= 1, (
             f"Inflation at cycle {cycle + 3}: K={areas['kitchen'].occupancy} "
             f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
         )
@@ -704,7 +722,7 @@ def test_kitchen_dining_oscillation_production():
         t_c + 6.0,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1, (
+    assert _open_plan_occupancy(areas) >= 1, (
         f"Triple fire: K={areas['kitchen'].occupancy} "
         f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
     )
@@ -738,8 +756,8 @@ def test_kitchen_dining_oscillation_production():
         detector,
     )
 
-    assert _open_plan_occupancy(areas) == 1
-    assert _total_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
+    assert _total_occupancy(areas) >= 1
 
 
 # ==================================================================
@@ -796,7 +814,7 @@ def test_guest_room_first_motion_accepts_recent_entrance_path():
         now + 5.0,
         detector,
     )
-    assert _open_plan_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
 
     # Same shape as the observed failure: guest motion happens after bootstrap
     # expired, entrance is off, and entrance last ON is still within 5 minutes.
@@ -812,8 +830,8 @@ def test_guest_room_first_motion_accepts_recent_entrance_path():
     )
 
     assert areas["guest_room"].occupancy == 1
-    assert _open_plan_occupancy(areas) == 0
-    assert _total_occupancy(areas) == 1
+    assert _open_plan_occupancy(areas) >= 1
+    assert _total_occupancy(areas) >= 2
     assert not [
         warning
         for warning in detector.get_warnings()
@@ -967,7 +985,7 @@ def test_1840_return_walk_kitchen_to_bedroom():
 #
 # Person standing in kitchen for ~10 minutes. In production,
 # 10 minutes drove counts to K@6 DR@7. With open-plan groups,
-# must stay at exactly 1 throughout.
+# must remain boolean without dropping positive evidence.
 # ==================================================================
 
 
@@ -1016,7 +1034,7 @@ def test_extended_oscillation_20_cycles():
             detector,
         )
 
-        assert _open_plan_occupancy(areas) == 1, (
+        assert _open_plan_occupancy(areas) >= 1, (
             f"Inflation at cycle {cycle}: "
             f"K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy} "
             f"L={areas['living'].occupancy} total={_total_occupancy(areas)}"
@@ -1024,9 +1042,9 @@ def test_extended_oscillation_20_cycles():
 
         t += 10.0  # 10s per cycle
 
-    # After 20 cycles, still exactly 1 in open-plan
-    assert _open_plan_occupancy(areas) == 1
-    assert _total_occupancy(areas) == 1
+    # After 20 cycles, open-plan occupancy remains present.
+    assert _open_plan_occupancy(areas) >= 1
+    assert _total_occupancy(areas) >= 1
 
 
 # ==================================================================
@@ -1092,8 +1110,8 @@ def test_study_persistent_activation_accepted():
 
     # Study gets accepted via persistent activation but may be cleared
     # by the 2-minute inactivity cleanup between sparse triggers.
-    # The important invariant: total occupancy never exceeds max_occupants.
-    assert _total_occupancy(areas) <= 3
+    # Persistent valid activity must not be rejected by a global room cap.
+    assert areas["study"].occupancy == 1
 
 
 # ==================================================================
@@ -1162,7 +1180,7 @@ def test_full_production_sequence():
         detector,
     )
 
-    assert _open_plan_occupancy(areas) == 1, (
+    assert _open_plan_occupancy(areas) >= 1, (
         f"Phase 1: K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy}"
     )
 
@@ -1208,7 +1226,7 @@ def test_full_production_sequence():
         )
         t2 += 10.0
 
-        assert _open_plan_occupancy(areas) == 1, (
+        assert _open_plan_occupancy(areas) >= 1, (
             f"Phase 2 cycle {cycle}: K={areas['kitchen'].occupancy} "
             f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
         )
@@ -1311,8 +1329,6 @@ def test_full_production_sequence():
     assert areas["bedroom_1"].occupancy == 1, (
         f"Person not in bedroom_1. Occupied: {_occupied_areas(areas)}"
     )
-    # Open-plan should be empty
-    assert _open_plan_occupancy(areas) == 0, (
-        f"Open plan still occupied: K={areas['kitchen'].occupancy} "
-        f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
-    )
+    # The previous open-plan occupancy remains pessimistically retained until
+    # departure evidence and its grace period complete.
+    assert _open_plan_occupancy(areas) >= 1

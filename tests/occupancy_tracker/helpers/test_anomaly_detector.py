@@ -35,7 +35,6 @@ class TestAnomalyDetector:
         assert detector.config == config
         assert detector.warnings == []
         assert detector.recent_motion_window == 120
-        assert detector.motion_timeout == 24 * 3600
         assert detector.extended_occupancy_threshold == 12 * 3600
 
     def test_create_warning(self):
@@ -158,8 +157,8 @@ class TestAnomalyDetector:
         assert warnings[0].type == "stuck_sensor"
         assert "sensor.motion_kitchen" in warnings[0].message
 
-    def test_check_timeouts_inactivity_reset(self):
-        """Test that areas are reset after 24 hours of inactivity."""
+    def test_check_timeouts_inactivity_warns_without_reset(self):
+        """Indoor inactivity is reported without claiming that the room is empty."""
         config = {"areas": {}, "adjacency": {}, "sensors": {}}
         detector = AnomalyDetector(config)
 
@@ -175,13 +174,12 @@ class TestAnomalyDetector:
 
         detector.check_timeouts(areas, timestamp)
 
-        # Should reset occupancy
-        assert areas["bedroom"].occupancy == 0
+        assert areas["bedroom"].occupancy == 1
 
         # Should create warning
         warnings = detector.get_warnings()
         assert len(warnings) == 1
-        assert warnings[0].type == "inactivity_timeout"
+        assert warnings[0].type == "extended_occupancy"
 
     def test_check_timeouts_extended_occupancy(self):
         """Test warning for extended occupancy (12+ hours)."""
@@ -230,6 +228,16 @@ class TestAnomalyDetector:
         # Should only have one warning
         warnings = detector.get_warnings()
         assert len(warnings) == 1
+
+    def test_check_timeouts_skips_unknown_inactivity_duration(self):
+        """Restored occupancy without a motion timestamp is not infinite inactivity."""
+        detector = AnomalyDetector({"areas": {}, "adjacency": {}, "sensors": {}})
+        area = AreaState("bedroom", {"name": "Bedroom"})
+        _set_occupancy(area, 1)
+
+        detector.check_timeouts({"bedroom": area}, time.time())
+
+        assert detector.get_warnings() == []
 
     def test_isolated_area_motion_is_not_unexpected(self):
         """An isolated area's own sensor is valid occupancy evidence."""
@@ -374,8 +382,8 @@ class TestPhantomOccupancyCleanup:
         """Simulate fresh probability."""
         return 0.60
 
-    def test_phantom_cleared_all_conditions_met(self):
-        """When all conditions met, phantom occupancy is cleared."""
+    def test_phantom_warned_all_conditions_met(self):
+        """Ambiguous indoor inactivity produces a warning, not vacancy."""
         config = self._make_config()
         detector = AnomalyDetector(config)
         areas = self._make_areas(config)
@@ -390,14 +398,16 @@ class TestPhantomOccupancyCleanup:
 
         now = self.BASE_TIME
 
-        cleared_area_ids = detector.check_timeouts(
-            areas, now, sensors=sensors, probability_fn=self._low_probability
+        result = detector.check_timeouts(
+            areas, now, sensors=sensors, freshness_fn=self._low_probability
         )
 
-        assert cleared_area_ids == ["bedroom"]
-        assert areas["bedroom"].occupancy == 0
+        assert result is None
+        assert areas["bedroom"].occupancy == 1
         warnings = [
-            w for w in detector.get_warnings() if w.type == "phantom_occupancy_cleared"
+            w
+            for w in detector.get_warnings()
+            if w.type == "phantom_occupancy_suspected"
         ]
         assert len(warnings) == 1
         assert warnings[0].area == "bedroom"
@@ -413,7 +423,7 @@ class TestPhantomOccupancyCleanup:
         areas["bedroom"].last_motion = self.BASE_TIME - 900  # 15 min ago
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
         assert areas["bedroom"].occupancy == 1
@@ -434,7 +444,7 @@ class TestPhantomOccupancyCleanup:
             areas,
             self.BASE_TIME,
             sensors=sensors,
-            probability_fn=self._high_probability,
+            freshness_fn=self._high_probability,
         )
 
         assert areas["bedroom"].occupancy == 1
@@ -453,7 +463,7 @@ class TestPhantomOccupancyCleanup:
         areas["hallway"].last_motion = self.BASE_TIME - 120
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
         assert areas["bedroom"].occupancy == 1
@@ -473,7 +483,7 @@ class TestPhantomOccupancyCleanup:
         sensors["sensor.hallway_motion"].update_state(True, self.BASE_TIME - 10)
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
         assert areas["bedroom"].occupancy == 1
@@ -490,14 +500,14 @@ class TestPhantomOccupancyCleanup:
         areas["hallway"].last_motion = self.BASE_TIME - 3600
         sensors["sensor.bedroom_motion"].update_state(True, self.BASE_TIME - 10)
 
-        cleared_area_ids = detector.check_timeouts(
+        result = detector.check_timeouts(
             areas,
             self.BASE_TIME,
             sensors=sensors,
-            probability_fn=self._low_probability,
+            freshness_fn=self._low_probability,
         )
 
-        assert cleared_area_ids == []
+        assert result is None
         assert areas["bedroom"].occupancy == 1
         assert not any(
             warning.type == "phantom_occupancy_cleared"
@@ -518,15 +528,15 @@ class TestPhantomOccupancyCleanup:
         sensor.current_state = True
         sensor.is_reliable = False
 
-        cleared_area_ids = detector.check_timeouts(
+        result = detector.check_timeouts(
             areas,
             self.BASE_TIME,
             sensors=sensors,
-            probability_fn=self._low_probability,
+            freshness_fn=self._low_probability,
         )
 
-        assert cleared_area_ids == ["bedroom"]
-        assert areas["bedroom"].occupancy == 0
+        assert result is None
+        assert areas["bedroom"].occupancy == 1
 
     def test_unavailable_own_sensor_does_not_block_cleanup(self):
         """A last-known ON state is ignored while its sensor is unavailable."""
@@ -542,15 +552,15 @@ class TestPhantomOccupancyCleanup:
         sensor.update_state(True, self.BASE_TIME - 10)
         sensor.mark_unavailable(self.BASE_TIME)
 
-        cleared_area_ids = detector.check_timeouts(
+        result = detector.check_timeouts(
             areas,
             self.BASE_TIME,
             sensors=sensors,
-            probability_fn=self._low_probability,
+            freshness_fn=self._low_probability,
         )
 
-        assert cleared_area_ids == ["bedroom"]
-        assert areas["bedroom"].occupancy == 0
+        assert result is None
+        assert areas["bedroom"].occupancy == 1
 
     def test_not_cleared_recent_magnetic_event(self):
         """Phantom cleanup skipped when a door sensor on the area changed recently."""
@@ -590,13 +600,13 @@ class TestPhantomOccupancyCleanup:
         sensors["sensor.hallway_door"].update_state(True, self.BASE_TIME - 600)
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
         assert areas["hallway"].occupancy == 1
 
-    def test_not_cleared_exit_capable(self):
-        """Exit-capable areas are not phantom-cleared (they have their own mechanism)."""
+    def test_exit_capable_timeout_is_diagnostic_only(self):
+        """Exit-capable inactivity warns without mutating occupancy."""
         config = self._make_config()
         detector = AnomalyDetector(config)
         areas = self._make_areas(config)
@@ -605,20 +615,17 @@ class TestPhantomOccupancyCleanup:
         _set_occupancy(areas["frontyard"], 1)
         areas["frontyard"].last_motion = self.BASE_TIME - 12000
 
-        # Note: exit-capable auto-clear at 5 min will fire first,
-        # but phantom check should also skip it independently
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
-        # Frontyard cleared by exit-capable mechanism, not phantom
-        phantom_warnings = [
-            w for w in detector.get_warnings() if w.type == "phantom_occupancy_cleared"
-        ]
-        assert len(phantom_warnings) == 0
+        assert areas["frontyard"].occupancy == 1
+        assert any(
+            warning.type == "exit_area_stale" for warning in detector.get_warnings()
+        )
 
-    def test_multiple_areas_only_phantom_cleared(self):
-        """Only the phantom area is cleared; legitimately occupied areas are kept."""
+    def test_multiple_areas_keep_possible_occupancy(self):
+        """Stale-looking indoor occupancy remains alongside fresh occupancy."""
         config = self._make_config()
         detector = AnomalyDetector(config)
         areas = self._make_areas(config)
@@ -641,11 +648,11 @@ class TestPhantomOccupancyCleanup:
             return 1.0  # Kitchen is fresh
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=probability
         )
 
         assert areas["kitchen"].occupancy == 1  # Kept
-        assert areas["bedroom"].occupancy == 0  # Cleared
+        assert areas["bedroom"].occupancy == 1
 
     def test_backward_compat_no_sensors(self):
         """check_timeouts works without sensors/probability_fn (existing behavior)."""
@@ -674,11 +681,13 @@ class TestPhantomOccupancyCleanup:
         areas["hallway"].last_motion = self.BASE_TIME - 3600
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
         warnings = [
-            w for w in detector.get_warnings() if w.type == "phantom_occupancy_cleared"
+            w
+            for w in detector.get_warnings()
+            if w.type == "phantom_occupancy_suspected"
         ]
         assert len(warnings) == 1
         w = warnings[0]
@@ -686,8 +695,8 @@ class TestPhantomOccupancyCleanup:
         assert "200" in w.message  # ~200 min of inactivity
         assert "12%" in w.message  # probability
 
-    def test_isolated_area_cleared(self):
-        """Area with no neighbors is cleared when other conditions met (vacuously true)."""
+    def test_isolated_indoor_area_is_not_cleared(self):
+        """Silence in an isolated room is still not proof of vacancy."""
         config = {
             "areas": {"isolated": {"name": "Isolated Room"}},
             "adjacency": {},
@@ -707,13 +716,13 @@ class TestPhantomOccupancyCleanup:
         areas["isolated"].last_motion = self.BASE_TIME - 12000
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
-        assert areas["isolated"].occupancy == 0
+        assert areas["isolated"].occupancy == 1
 
-    def test_occupancy_greater_than_one_fully_cleared(self):
-        """clear_occupancy sets occupancy to 0, not decrement by 1."""
+    def test_legacy_count_remains_conservatively_occupied(self):
+        """Legacy count input remains a boolean occupied state."""
         config = self._make_config()
         detector = AnomalyDetector(config)
         areas = self._make_areas(config)
@@ -724,7 +733,7 @@ class TestPhantomOccupancyCleanup:
         areas["hallway"].last_motion = self.BASE_TIME - 3600
 
         detector.check_timeouts(
-            areas, self.BASE_TIME, sensors=sensors, probability_fn=self._low_probability
+            areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
-        assert areas["bedroom"].occupancy == 0
+        assert areas["bedroom"].occupancy == 1

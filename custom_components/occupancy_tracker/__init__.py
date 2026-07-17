@@ -7,7 +7,7 @@ import time
 
 import voluptuous as vol
 
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.event import (
@@ -16,7 +16,7 @@ from homeassistant.helpers.event import (
 )
 from datetime import timedelta
 
-from .const import DOMAIN
+from .const import ATTR_AREA_ID, DOMAIN, SERVICE_CLEAR_STALE_OCCUPANCY
 from .helpers.constants import MOTION_SENSOR_TYPES
 from .helpers.types import OccupancyTrackerConfig
 from .coordinator import OccupancyCoordinator
@@ -121,7 +121,8 @@ AREA_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
-# Schema for open-plan group configuration
+# Deprecated compatibility schema. The conservative resolver no longer groups
+# areas; keeping this accepted avoids breaking existing YAML.
 OPEN_PLAN_GROUP_SCHEMA = vol.Schema(
     {
         vol.Required("areas"): vol.All([cv.string]),
@@ -159,7 +160,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         "areas": conf.get("areas", {}),
         "adjacency": conf.get("adjacency", {}),
         "sensors": conf.get("sensors", {}),
-        "open_plan_groups": conf.get("open_plan_groups", {}),
     }
 
     # Set up dedicated log file
@@ -174,9 +174,23 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # Create the coordinator instance.
     coordinator = OccupancyCoordinator(hass, occupancy_config)
+    await coordinator.async_restore_occupancy()
 
     # Store the coordinator
     hass.data[DOMAIN] = {"coordinator": coordinator}
+
+    async def clear_stale_occupancy_service(call: ServiceCall) -> None:
+        """Clear only the room explicitly asserted empty by the caller."""
+        coordinator.clear_stale_occupancy([call.data[ATTR_AREA_ID]])
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CLEAR_STALE_OCCUPANCY,
+        clear_stale_occupancy_service,
+        schema=vol.Schema(
+            {vol.Required(ATTR_AREA_ID): vol.In(sorted(coordinator.areas))}
+        ),
+    )
 
     async def state_change_listener(event: Event) -> None:
         """Handle state changes for sensors."""
@@ -233,9 +247,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     timestamp,
                 )
 
-    # Set up periodic check for timeouts (every 60 seconds)
-    # Note: The coordinator also has a 5-second update_interval for consistency checks.
-    # This 60-second check is specifically for longer-term anomalies.
+    # Run the single periodic diagnostics check every 60 seconds.
     async def interval_listener(now) -> None:
         """Handle periodic checks."""
         coordinator.check_timeouts(timestamp=now.timestamp())
@@ -250,6 +262,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def _cleanup_timer(event):
         remove_interval()
+        hass.services.async_remove(DOMAIN, SERVICE_CLEAR_STALE_OCCUPANCY)
         # Also stop the coordinator's periodic updates
         await coordinator.async_shutdown()
 
