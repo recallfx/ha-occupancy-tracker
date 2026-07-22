@@ -5,7 +5,7 @@ the FULL 21-area house config. Asserts boolean occupancy and no false vacancy
 at key checkpoints.
 
 Log source: ssh 192.168.1.10 /config/occupancy_tracker.log
-Config source: ssh 192.168.1.10 /config/occupancy_tracker.yaml
+Config source: the repository's config.yaml, kept byte-identical to the live file.
 
 IMPORTANT BEHAVIORAL NOTE:
 Corridor spill (corridor_1 fires study, bedroom_2, corridor_2 within 0.06-1.4s)
@@ -16,7 +16,10 @@ of a real person. The critical invariant is: **the open-plan group never inflate
 beyond 1** and the person's final position is correct.
 """
 
+from pathlib import Path
 import time
+
+import yaml
 
 from custom_components.occupancy_tracker.helpers.map_occupancy_resolver import (
     MapOccupancyResolver,
@@ -117,8 +120,16 @@ PRODUCTION_CONFIG = {
         "garage": {"name": "Garage", "indoors": True},
         "guest_room": {"name": "Guest Toilet", "indoors": True},
         "workshop": {"name": "Workshop", "indoors": True},
-        "corridor_1": {"name": "Corridor 1 (Front)", "indoors": True},
-        "corridor_2": {"name": "Corridor 2 (Back)", "indoors": True},
+        "corridor_1": {
+            "name": "Corridor 1 (Front)",
+            "indoors": True,
+            "transition": True,
+        },
+        "corridor_2": {
+            "name": "Corridor 2 (Back)",
+            "indoors": True,
+            "transition": True,
+        },
         "kitchen": {"name": "Kitchen", "indoors": True},
         "dining_room": {"name": "Dining Room", "indoors": True},
         "living": {"name": "Living Room", "indoors": True},
@@ -300,6 +311,14 @@ PRODUCTION_CONFIG = {
         },
     },
 }
+
+
+def test_checked_in_config_matches_production_replay():
+    """Keep the committed production config and replay fixture identical."""
+    config_path = Path(__file__).resolve().parents[2] / "config.yaml"
+    checked_in_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert checked_in_config == PRODUCTION_CONFIG
 
 
 def _make_system():
