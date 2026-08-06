@@ -6,8 +6,12 @@ Verifies that the system is deterministic by comparing recorded vs replayed stat
 
 import pytest
 import time
+from unittest.mock import Mock
 
 from custom_components.occupancy_tracker.coordinator import OccupancyCoordinator
+from custom_components.occupancy_tracker.helpers.map_state_recorder import (
+    MapStateRecorder,
+)
 from custom_components.occupancy_tracker.helpers.history_verifier import (
     HistoryVerifier,
     StateDifference,
@@ -292,6 +296,28 @@ async def test_coordinator_verify_history_preserves_state(hass, config):
         coordinator.occupancy_resolver._first_activation_time
         == original_first_activation
     )
+
+
+def test_bounded_history_rebuild_cannot_mutate_live_occupancy(hass, config):
+    """Evicted restore evidence must never turn a consistency check into a clear."""
+    coordinator = OccupancyCoordinator(hass, config, store=Mock())
+    coordinator.state_recorder = MapStateRecorder(max_snapshots=2)
+
+    coordinator.process_sensor_event("motion_a", True, 100.0)
+    coordinator.process_sensor_event("motion_a", False, 101.0)
+    coordinator.process_sensor_event("motion_b", True, 200.0)
+    coordinator.process_sensor_event("motion_b", False, 201.0)
+    assert not any(
+        snapshot.description and "motion_a" in snapshot.description
+        for snapshot in coordinator.state_recorder.get_history()
+    )
+    original_latches = set(coordinator.occupancy_resolver.indoor_latched)
+
+    result = coordinator.rebuild_from_history()
+
+    assert result is False
+    assert coordinator.occupancy_resolver.indoor_latched == original_latches
+    assert coordinator.get_occupancy("room_a") == 1
 
 
 def test_state_difference_string_representation():

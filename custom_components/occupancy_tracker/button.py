@@ -36,4 +36,4 @@ class ClearStaleOccupancyButton(ButtonEntity):
 
     async def async_press(self) -> None:
         """Clear rooms without active positive sensor evidence."""
-        self._coordinator.clear_stale_occupancy()
+        self._coordinator.clear_stale_occupancy(actor="button", reason="manual_button")

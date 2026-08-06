@@ -11,7 +11,7 @@ from .sensor_state import SensorState
 from .types import OccupancyTrackerConfig
 
 
-_LOGGER = logging.getLogger("resolver")
+_LOGGER = logging.getLogger(__name__)
 
 
 class MapOccupancyResolver:
@@ -47,22 +47,29 @@ class MapOccupancyResolver:
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
         area_ids: Iterable[str] | None = None,
+        reason: str = "manual_clear",
     ) -> list[str]:
         """Explicitly clear indoor latches without rejecting active sensors."""
         active_areas = self._compute_sensor_active_areas(sensors)
-        targets = (
-            set(self.indoor_latched)
-            if area_ids is None
-            else self.indoor_latched.intersection(area_ids)
-        )
+        requested = set(areas) if area_ids is None else set(area_ids)
+        targets = {
+            area_id
+            for area_id in requested
+            if area_id in areas and areas[area_id].is_indoors
+        }
         cleared: list[str] = []
 
         for area_id in sorted(targets):
             if area_id in active_areas:
                 continue
-            self.indoor_latched.remove(area_id)
-            if area_id in areas:
-                areas[area_id].clear_occupancy(timestamp, reason="manual_clear")
+            needs_clear = (
+                area_id in self.indoor_latched
+                or areas[area_id].occupied
+                or not areas[area_id].state_known
+            )
+            self.indoor_latched.discard(area_id)
+            if needs_clear:
+                areas[area_id].clear_occupancy(timestamp, reason=reason)
                 cleared.append(area_id)
 
         return cleared
@@ -212,6 +219,9 @@ class MapOccupancyResolver:
                 last_motion = stored_area.get("last_motion")
                 if isinstance(last_motion, (int, float)) and last_motion > 0:
                     area.last_motion = float(last_motion)
+                last_contact = stored_area.get("last_contact")
+                if isinstance(last_contact, (int, float)) and last_contact > 0:
+                    area.last_contact = float(last_contact)
                 stale_since = stored_area.get("stale_since")
                 area.stale_since = (
                     float(stale_since)
@@ -220,7 +230,7 @@ class MapOccupancyResolver:
                 )
                 area.cleared_by = None
                 self.indoor_latched.add(area_id)
-                area.occupied = True
+                area.apply_resolved_occupancy(True)
             return None
 
         cleared_area_ids = self._parse_clear_event(snapshot)
@@ -293,6 +303,7 @@ class MapOccupancyResolver:
                     if is_available:
                         sensor.is_available = True
                         sensor.last_update_time = snapshot.timestamp
+                        sensor.last_source_timestamp = snapshot.timestamp
                     else:
                         sensor.mark_unavailable(snapshot.timestamp)
             else:
@@ -322,8 +333,10 @@ class MapOccupancyResolver:
         for area_id in sensor.area_ids:
             area = areas.get(area_id)
             if area:
-                area.record_motion(timestamp)
-                _LOGGER.debug(f"Magnetic event on {sensor.id} kept {area_id} active")
+                area.record_contact(timestamp, is_open=new_state)
+                _LOGGER.debug(
+                    "Contact event on %s recorded activity in %s", sensor.id, area_id
+                )
         return None
 
     # ------------------------------------------------------------------
@@ -430,7 +443,7 @@ class MapOccupancyResolver:
         final_occupied = sensor_active_areas | self.indoor_latched
 
         for area_id, area in areas.items():
-            area.occupied = area_id in final_occupied
+            area.apply_resolved_occupancy(area_id in final_occupied)
 
         if _LOGGER.isEnabledFor(logging.DEBUG):
             occ = {aid for aid, a in areas.items() if a.occupied}

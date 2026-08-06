@@ -53,6 +53,7 @@ def test_system_status_summarizes_evidence_states():
         "stale": 1,
         "inferred": 0,
         "vacant": 0,
+        "unknown": 0,
     }
 
 

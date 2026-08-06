@@ -1,5 +1,6 @@
 """The occupancy_tracker integration."""
 
+from datetime import timedelta
 import logging
 import logging.handlers
 import os
@@ -14,49 +15,78 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
-from datetime import timedelta
-
 from .const import ATTR_AREA_ID, DOMAIN, SERVICE_CLEAR_STALE_OCCUPANCY
-from .helpers.constants import MOTION_SENSOR_TYPES
-from .helpers.types import OccupancyTrackerConfig
 from .coordinator import OccupancyCoordinator
+from .helpers.audit import AUDIT_LOGGER_NAME, audit_event
+from .helpers.constants import MOTION_SENSOR_TYPES
+from .helpers.room_profiles import ROOM_PROFILES
+from .helpers.types import OccupancyTrackerConfig
 
-_LOGGER = logging.getLogger("occupancy_tracker")
-_RAW_LOGGER = logging.getLogger("occupancy_tracker.raw")
+_LOGGER = logging.getLogger(__name__)
+_RAW_LOGGER = logging.getLogger(f"{__package__}.raw")
 
-# All loggers used by this integration
-_INTEGRATION_LOGGERS = [
-    "occupancy_tracker",
-    "resolver",
-    "coordinator",
-    "anomaly_detector",
-]
+
+def _add_rotating_handler(
+    logger: logging.Logger,
+    path: str,
+    *,
+    max_bytes: int,
+    backup_count: int,
+    formatter: logging.Formatter,
+) -> None:
+    """Add a rotating handler once, including across setup retries."""
+    if any(
+        isinstance(handler, logging.handlers.RotatingFileHandler)
+        and os.path.abspath(handler.baseFilename) == os.path.abspath(path)
+        for handler in logger.handlers
+    ):
+        return
+
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=backup_count
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 
 def _setup_file_logging(config_dir: str) -> None:
-    """Set up a dedicated log file for the occupancy tracker integration."""
+    """Set up concise operational, legacy replay, and audit logs."""
     log_path = os.path.join(config_dir, "occupancy_tracker.log")
-    handler = logging.handlers.RotatingFileHandler(
-        log_path, maxBytes=5 * 1024 * 1024, backupCount=3
+    integration_logger = logging.getLogger(__package__)
+    _add_rotating_handler(
+        integration_logger,
+        log_path,
+        max_bytes=5 * 1024 * 1024,
+        backup_count=3,
+        formatter=logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"),
     )
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-    )
-    for name in _INTEGRATION_LOGGERS:
-        logger = logging.getLogger(name)
-        logger.addHandler(handler)
-        logger.setLevel(logging.DEBUG)
+    integration_logger.setLevel(logging.INFO)
 
-    # Raw sensor event log — clean CSV for replay testing (going forward)
+    # Legacy sensor-only CSV remains available for existing replay tools.
     raw_path = os.path.join(config_dir, "occupancy_tracker_raw.csv")
-    raw_handler = logging.handlers.RotatingFileHandler(
-        raw_path, maxBytes=10 * 1024 * 1024, backupCount=3
+    raw_logger = logging.getLogger(f"{__package__}.raw")
+    _add_rotating_handler(
+        raw_logger,
+        raw_path,
+        max_bytes=10 * 1024 * 1024,
+        backup_count=3,
+        formatter=logging.Formatter("%(message)s"),
     )
-    raw_handler.setFormatter(logging.Formatter("%(message)s"))
-    raw_logger = logging.getLogger("occupancy_tracker.raw")
-    raw_logger.addHandler(raw_handler)
     raw_logger.setLevel(logging.DEBUG)
     raw_logger.propagate = False
+
+    # Authoritative JSONL audit includes decisions that sensor-only CSV misses.
+    audit_path = os.path.join(config_dir, "occupancy_tracker_audit.jsonl")
+    audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
+    _add_rotating_handler(
+        audit_logger,
+        audit_path,
+        max_bytes=10 * 1024 * 1024,
+        backup_count=3,
+        formatter=logging.Formatter("%(message)s"),
+    )
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
 
 
 # Schema for individual sensor configuration
@@ -117,6 +147,8 @@ AREA_SCHEMA = vol.Schema(
         vol.Optional("name"): cv.string,
         vol.Optional("indoors", default=True): cv.boolean,
         vol.Optional("exit_capable", default=False): cv.boolean,
+        vol.Optional("transition", default=False): cv.boolean,
+        vol.Optional("profile"): vol.In(ROOM_PROFILES),
     },
     extra=vol.ALLOW_EXTRA,
 )
@@ -165,8 +197,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # Set up dedicated log file
     _setup_file_logging(hass.config.config_dir)
 
-    # One-shot: export sensor history from recorder DB for replay testing
-    _export_sensor_history(hass.config.config_dir, occupancy_config)
+    # Keep the one-shot legacy export off Home Assistant's event loop.
+    await hass.async_add_executor_job(
+        _export_sensor_history,
+        hass.config.config_dir,
+        occupancy_config,
+    )
 
     # Validate configuration
     if not _validate_config(occupancy_config):
@@ -181,7 +217,11 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def clear_stale_occupancy_service(call: ServiceCall) -> None:
         """Clear only the room explicitly asserted empty by the caller."""
-        coordinator.clear_stale_occupancy([call.data[ATTR_AREA_ID]])
+        user_id = call.context.user_id
+        actor = f"user:{user_id}" if user_id else "service"
+        coordinator.clear_stale_occupancy(
+            [call.data[ATTR_AREA_ID]], actor=actor, reason="manual_service"
+        )
 
     hass.services.async_register(
         DOMAIN,
@@ -201,14 +241,21 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         sensors = occupancy_config.get("sensors", {})
         if entity_id in sensors:
-            timestamp = time.time()
+            received_timestamp = time.time()
+            timestamp = (
+                new_state.last_updated.timestamp() if new_state else received_timestamp
+            )
 
             # Handle sensor unavailability
             if new_state is None or new_state.state in ["unavailable", "unknown"]:
                 _LOGGER.warning(
                     f"Sensor {entity_id} is unavailable or in unknown state"
                 )
-                coordinator.invalidate_sensor_state(entity_id, timestamp=timestamp)
+                coordinator.invalidate_sensor_state(
+                    entity_id,
+                    timestamp=timestamp,
+                    received_timestamp=received_timestamp,
+                )
                 return
 
             # Interpret HA state: 'on' becomes True; any other value is False
@@ -221,7 +268,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
             # Process event through coordinator
             coordinator.process_sensor_event(
-                entity_id, sensor_state, timestamp=timestamp
+                entity_id,
+                sensor_state,
+                timestamp=timestamp,
+                received_timestamp=received_timestamp,
             )
 
     # Set up state listeners for each sensor entity defined in the occupancy config.
@@ -232,28 +282,58 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         # Restore states already present when the integration starts. Motion ON
         # is live occupancy evidence; other states are only cached baselines.
         startup_timestamp = time.time()
-        for index, entity_id in enumerate(sensor_entities):
-            timestamp = startup_timestamp + index * 0.000001
+        startup_states = []
+        for position, entity_id in enumerate(sensor_entities):
             state = hass.states.get(entity_id)
+            timestamp = (
+                state.last_changed.timestamp()
+                if state is not None
+                else startup_timestamp
+            )
+            startup_states.append((timestamp, position, entity_id, state))
+
+        for timestamp, _position, entity_id, state in sorted(startup_states):
             sensor_type = occupancy_config["sensors"][entity_id].get("type", "")
             if state is None or state.state in ["unavailable", "unknown"]:
-                coordinator.invalidate_sensor_state(entity_id, timestamp)
+                coordinator.invalidate_sensor_state(
+                    entity_id,
+                    timestamp,
+                    received_timestamp=startup_timestamp,
+                )
             elif state.state == "on" and sensor_type in MOTION_SENSOR_TYPES:
-                coordinator.process_sensor_event(entity_id, True, timestamp=timestamp)
+                coordinator.process_sensor_event(
+                    entity_id,
+                    True,
+                    timestamp=timestamp,
+                    received_timestamp=startup_timestamp,
+                )
             else:
                 coordinator.seed_sensor_state(
                     entity_id,
                     state.state.lower() == "on",
                     timestamp,
+                    received_timestamp=startup_timestamp,
                 )
 
-    # Run the single periodic diagnostics check every 60 seconds.
+        audit_event(
+            "startup_baseline_complete",
+            timestamp=startup_timestamp,
+            sensors=len(sensor_entities),
+            unknown_sensors=sum(
+                not sensor.is_available for sensor in coordinator.sensors.values()
+            ),
+            occupied_areas=sorted(
+                area_id for area_id, area in coordinator.areas.items() if area.occupied
+            ),
+        )
+
+    # Keep transition-area activity responsive without changing occupancy.
     async def interval_listener(now) -> None:
         """Handle periodic checks."""
         coordinator.check_timeouts(timestamp=now.timestamp())
 
     remove_interval = async_track_time_interval(
-        hass, interval_listener, timedelta(seconds=60)
+        hass, interval_listener, timedelta(seconds=10)
     )
     hass.data[DOMAIN]["remove_update_listener"] = remove_interval
 

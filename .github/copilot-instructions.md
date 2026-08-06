@@ -4,18 +4,18 @@
 
 ## Architecture overview
 
-Home Assistant integration for room presence detection using probabilistic state tracking. Event-driven, not polling.
+Home Assistant integration for conservative room occupancy and short-lived activity tracking.
 
 **Core flow**: HA sensor events → `__init__.py:state_change_listener` → `coordinator.process_sensor_event()` → `MapOccupancyResolver.process_snapshot()` → state mutations → `async_set_updated_data()`
 
 **Key components**:
 - `OccupancyCoordinator` (`coordinator.py`): Owns all state (`self.areas`, `self.sensors`), orchestrates helpers.
-- `MapOccupancyResolver` (`helpers/map_occupancy_resolver.py`): Stateless logic engine - processes snapshots, mutates AreaState in-place. Uses an **activation-window model** for movement.
-- `AreaState` / `SensorState` (`helpers/`): Data models with occupancy counts, timestamps, activity history.
+- `MapOccupancyResolver` (`helpers/map_occupancy_resolver.py`): Applies trusted live evidence and the durable indoor latch.
+- `AreaState` / `SensorState` (`helpers/`): Boolean occupancy, evidence timestamps, availability, reliability, and activity history.
 - `AnomalyDetector` (`helpers/anomaly_detector.py`): Generates warnings for stuck sensors, impossible movements, and timeouts.
 - `MapStateRecorder`: Captures immutable snapshots for history replay and crash recovery.
 
-**Key principle**: Occupancy is an integer counter. People move via adjacency map. Movement is only confirmed when a sensor turns OFF and a neighbor has a matching activation window.
+**Key principle**: Indoor positive evidence is retained until an explicit clear. Sensor OFF, movement elsewhere, and time decay cannot prove vacancy. Adjacency is diagnostic only.
 
 ## Configuration
 
@@ -56,15 +56,21 @@ uv run pytest -v -m end_to_end          # by marker
 
 **Unit test pattern**: Mock `HomeAssistant`, pass config dict directly to `OccupancyCoordinator(hass, config)`.
 
+CI also runs the full suite against Home Assistant 2026.7.3/Python 3.14, matching the deployed host.
+
 ## Critical patterns
 
-**Motion-ON**: Mark area occupied immediately (leading activation). Check adjacent areas for "plausible source" (occupied or active). If none found, flag anomaly (e.g., `no_adjacent_source`) but still add occupancy.
+**Motion-ON**: Mark every configured area occupied immediately. If adjacency cannot explain it, warn but keep the evidence.
 
-**Motion-OFF**: Person STAYS unless an adjacent sensor activated *after* this area turned ON and *before/at* this area turned OFF. If valid neighbor(s) found, move occupancy (clear source, mark targets). Supports multi-hop through active paths.
+**Motion-OFF**: End live motion activity. Indoor occupancy remains latched; outdoor occupancy follows current trusted evidence.
 
-**Consistency resolution**: Periodic consistency checks are **disabled** in the lean architecture. Logic is purely event-driven.
+**Room profiles**: `transition`, `living`, and `sleeping` tune activity holds, freshness decay, and warning windows. They never clear durable occupancy.
 
-**Probability decay**: 100% → 90% → exponential decay to 10% over ~1 hour. Formula in `get_occupancy_probability()`.
+**Contacts**: Door/window edges are separate contact activity. They do not fabricate motion or latch occupancy.
+
+**Persistence**: Every indoor area is persisted as `possible`, `cleared`, or `unknown`. Missing storage remains unknown, not vacant.
+
+**Audit**: `occupancy_tracker_audit.jsonl` records source/receipt times, accepted and ignored decisions, clears, restores, trust changes, and warning lifecycle.
 
 ## Simulation
 
@@ -74,9 +80,9 @@ Uses `SimOccupancyCoordinator` wrapping the real coordinator, loads from `config
 
 ## Common pitfalls
 
-- Don't poll - system is event-driven. Use `async_set_updated_data()` after state changes.
+- The ten-second periodic check refreshes activity/freshness and warning predicates; it must never clear indoor occupancy.
 - Adjacency is auto-bidirectional.
-- `exit_capable` areas auto-clear after 5min.
+- `exit_capable` does not weaken the indoor latch. Only outdoor areas follow live evidence directly.
 - `indoors` defaults to true; set false for outdoor areas to improve anomaly detection.
 - Sensor entity IDs must match HA format (`binary_sensor.xyz`).
 - State is mutable - `MapOccupancyResolver` modifies `AreaState` objects directly.
@@ -90,6 +96,12 @@ Write like a human. Avoid flowery language, summary phrases, vague statements, a
 ## Session Log
 
 Document significant decisions, findings, and context that future sessions need to know. Most recent entries first.
+
+### 2026-08-07: Conservative profiles, persistence, and audit
+- Added transition/living/sleeping profiles for activity, freshness, and diagnostic decay without weakening durable occupancy.
+- Missing persistence now stays unknown; explicit clears and possible occupancy survive restart with motion/contact evidence.
+- Contacts no longer fabricate motion, warning predicates resolve, stuck sensors are checked periodically, and old events cannot rewind newer sensor state.
+- Added concise operational logging, structured JSONL audit, and a CI gate matching production Home Assistant 2026.7.3.
 
 ### 2025-12-20: Activation-Window Refactor
 - Refactored `MapOccupancyResolver` to use an activation-window model.

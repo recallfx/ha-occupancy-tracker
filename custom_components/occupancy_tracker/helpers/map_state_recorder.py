@@ -221,8 +221,10 @@ class MapStateRecorder:
                 "occupancy": area.occupancy,
                 "is_occupied": area.is_occupied,
                 "last_motion": area.last_motion,
+                "last_contact": area.last_contact,
                 "stale_since": area.stale_since,
                 "cleared_by": area.cleared_by,
+                "state_known": area.state_known,
             }
         return payload
 
@@ -234,6 +236,7 @@ class MapStateRecorder:
             payload[sensor_id] = {
                 "state": sensor.current_state,
                 "last_changed": sensor.last_changed,
+                "last_source_timestamp": sensor.last_source_timestamp,
                 "available": sensor.is_available,
                 "reliable": sensor.is_reliable,
                 "stuck": sensor.is_stuck,

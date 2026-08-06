@@ -35,18 +35,21 @@ areas:
   bedroom_2:
     name: Bedroom 2
     indoors: true
+    profile: sleeping
   bathroom:
     name: Bathroom
     indoors: true
   bedroom_1:
     name: Bedroom 1
     indoors: true
+    profile: sleeping
   utility_room:
     name: Utility Room
     indoors: true
   main_bedroom:
     name: Main Bedroom
     indoors: true
+    profile: sleeping
   main_bathroom:
     name: Main Bathroom
     indoors: true

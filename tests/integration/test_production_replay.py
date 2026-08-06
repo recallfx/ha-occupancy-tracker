@@ -5,15 +5,13 @@ the FULL 21-area house config. Asserts boolean occupancy and no false vacancy
 at key checkpoints.
 
 Log source: ssh 192.168.1.10 /config/occupancy_tracker.log
-Config source: the repository's config.yaml, kept byte-identical to the live file.
+Config source: the repository's production configuration baseline.
 
 IMPORTANT BEHAVIORAL NOTE:
 Corridor spill (corridor_1 fires study, bedroom_2, corridor_2 within 0.06-1.4s)
-can create additional claims via "new entry with evidence" when the spill target
-has a recently-active neighbor. These are transient claims that represent the
-resolver's conservative approach — better to over-count briefly than lose track
-of a real person. The critical invariant is: **the open-plan group never inflates
-beyond 1** and the person's final position is correct.
+can mark additional rooms as possibly occupied. The conservative resolver keeps
+those rooms until an explicit clear. The critical invariants are that every room
+remains boolean and positive evidence is never converted into a false vacancy.
 """
 
 from pathlib import Path
@@ -134,11 +132,23 @@ PRODUCTION_CONFIG = {
         "dining_room": {"name": "Dining Room", "indoors": True},
         "living": {"name": "Living Room", "indoors": True},
         "study": {"name": "Study", "indoors": True},
-        "bedroom_2": {"name": "Bedroom 2", "indoors": True},
+        "bedroom_2": {
+            "name": "Bedroom 2",
+            "indoors": True,
+            "profile": "sleeping",
+        },
         "bathroom": {"name": "Bathroom", "indoors": True},
-        "bedroom_1": {"name": "Bedroom 1", "indoors": True},
+        "bedroom_1": {
+            "name": "Bedroom 1",
+            "indoors": True,
+            "profile": "sleeping",
+        },
         "utility_room": {"name": "Utility Room", "indoors": True},
-        "main_bedroom": {"name": "Main Bedroom", "indoors": True},
+        "main_bedroom": {
+            "name": "Main Bedroom",
+            "indoors": True,
+            "profile": "sleeping",
+        },
         "main_bathroom": {"name": "Main Bathroom", "indoors": True},
         "wardrobe": {"name": "Wardrobe", "indoors": True},
         # Outdoor

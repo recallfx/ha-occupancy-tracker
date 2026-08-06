@@ -17,6 +17,8 @@ class SensorState:
         self.last_changed = 0  # Only set by real state changes, not init
         self.activated_at = None  # Timestamp when sensor last transitioned OFF→ON (None if never activated)
         self.last_update_time = timestamp
+        # Ordering uses source time rather than object creation or receipt time.
+        self.last_source_timestamp = 0
         self.history = []  # List of (timestamp, state) tuples
         self.is_available = True
         self.is_reliable = True
@@ -27,6 +29,7 @@ class SensorState:
 
         # Update last update time
         self.last_update_time = timestamp
+        self.last_source_timestamp = timestamp
 
         # A valid HA state restores transport availability. Reliability is a
         # separate signal used for genuinely stuck sensors.
@@ -54,12 +57,14 @@ class SensorState:
     def mark_unavailable(self, timestamp: float) -> None:
         """Stop trusting the last physical state without inventing an edge."""
         self.last_update_time = timestamp
+        self.last_source_timestamp = timestamp
         self.is_available = False
 
     def seed_state(self, state: bool, timestamp: float) -> None:
         """Set a startup baseline without recording a new sensor event."""
         self.current_state = state
         self.last_update_time = timestamp
+        self.last_source_timestamp = timestamp
         self.is_available = True
 
     @property
@@ -71,6 +76,7 @@ class SensorState:
         """Detect if sensor appears stuck in one state."""
 
         if not self.is_available:
+            self.is_stuck = False
             return False
 
         # For ON state, check if it's been stuck for 24 hours (86400 seconds)
@@ -91,6 +97,7 @@ class SensorState:
         self.last_changed = 0
         self.activated_at = None
         self.last_update_time = 0
+        self.last_source_timestamp = 0
         self.history = []
         self.is_available = True
         self.is_reliable = True

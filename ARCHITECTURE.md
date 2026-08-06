@@ -28,15 +28,21 @@ conservative indoor latches. Adjacency is diagnostic only; there are no cluster
 leaders, movement caps, or inferred departures in the occupancy decision.
 
 Each area also exposes a non-authoritative `Activity` binary sensor. It is ON
-while trusted live evidence exists or for 120 seconds after recorded activity.
+while trusted live motion evidence exists or for the room profile's hold time
+after motion or contact activity: 20 seconds for transition spaces, 120 seconds
+for living areas, and 900 seconds for sleeping areas.
 It may turn OFF while a person is still present, so it is never an input to the
-durable occupancy decision. The periodic refresh is one minute, which means a
-quiet activity entity can remain ON for up to roughly one extra minute.
+durable occupancy decision. The periodic refresh is ten seconds.
+
+Room profiles also tune freshness decay and warning windows. They never tune
+the durable indoor latch. A corridor can therefore become quiet quickly without
+being falsely declared vacant, while a bedroom avoids warnings during sleep.
 
 ## Event flow
 
 1. Home Assistant reports a configured sensor state change.
-2. `OccupancyCoordinator` updates `SensorState` and records a `MapSnapshot`.
+2. `OccupancyCoordinator` preserves both the sensor's source timestamp and the
+   local receipt timestamp, updates `SensorState`, and records a `MapSnapshot`.
 3. `MapOccupancyResolver` processes the event.
 4. Trusted positive indoor evidence is added to `indoor_latched`.
 5. Adjacency plausibility may produce a warning but cannot reject the event.
@@ -44,6 +50,13 @@ quiet activity entity can remain ON for up to roughly one extra minute.
 7. Home Assistant entities are updated.
 
 Repeated motion ON events are useful presence refreshes. Unavailable, unreliable, or stuck sensor states are not treated as current positive evidence.
+Events older than the latest accepted source time for that sensor, or with an
+implausibly future timestamp, are audited and ignored instead of rewinding live
+state. Startup ON states are aged against their receipt time for stuck-sensor
+detection.
+
+Magnetic edges are recorded separately as contact activity. They are useful
+context but do not fabricate motion evidence or latch a room occupied.
 
 ## Anomaly handling
 
@@ -78,6 +91,8 @@ Each area exposes an `evidence_state`:
 - `stale`: indoor occupancy is latched but no trusted sensor is currently ON;
 - `inferred`: compatibility state for occupied data without live evidence or an indoor latch;
 - `vacant`: no current occupancy evidence.
+- `unknown`: durable indoor state was not restored and no later evidence or
+  explicit clear has established it.
 
 It also exposes `active_sensors`, `last_positive_evidence`, `stale_since`, and
 `cleared_by`. `freshness` is a time-since-motion score, not a calibrated
@@ -86,18 +101,34 @@ compatibility aliases.
 
 ## Replay and persistence
 
-`MapStateRecorder` records events in memory and supports deterministic replay during the current integration lifetime.
+`MapStateRecorder` records a bounded event history in memory and supports
+non-mutating deterministic verification during the current integration
+lifetime. This bounded history is not an authority for clearing live state.
 
-The conservative latch is also stored in Home Assistant's versioned storage under `occupancy_tracker.occupancy_state`. The durable payload contains only latched indoor area IDs and their last persisted motion timestamps.
+The conservative state is stored in Home Assistant's versioned storage under
+`occupancy_tracker.occupancy_state`. Each indoor area is persisted as
+`possible`, `cleared`, or `unknown`, together with its last motion/contact
+evidence where available. Missing or unreadable storage leaves indoor areas
+unknown rather than claiming vacancy.
 
 Startup ordering is deliberate:
 
 1. Load persistent occupancy.
-2. Restore indoor latches and last-motion timestamps.
+2. Restore possible, explicitly cleared, and unknown indoor states plus evidence timestamps.
 3. Record the restoration for deterministic in-memory replay.
 4. Process current Home Assistant sensor states.
 
 An initial OFF state does not clear restored occupancy. A current trusted ON state may add or refresh live evidence. Explicit stale cleanup updates both replay history and persistent storage.
+
+## Logging and audit
+
+Routine events without occupancy changes are DEBUG-only in the operational log.
+The separate JSONL audit records every sensor decision, including ignored
+duplicates, source and receipt timestamps, occupancy/latch deltas, availability,
+trust changes, restore/clear/reset actions, and warning open/resolve events.
+Manual clear records its actor and any rooms refused because a trusted sensor is
+still active. Handlers are installed idempotently so a setup retry does not
+duplicate every line.
 
 ## Lighting boundary
 

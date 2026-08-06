@@ -12,6 +12,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
 from .helpers.constants import MOTION_SENSOR_TYPES
+from .helpers.audit import audit_event
 from .helpers.types import OccupancyTrackerConfig
 from .helpers.anomaly_detector import AnomalyDetector
 from .helpers.warning import Warning
@@ -23,10 +24,21 @@ from .helpers.history_verifier import HistoryVerifier
 from .helpers.log_formatter import LogFormatter
 from .diagnostics import OccupancyDiagnostics
 
-_LOGGER = logging.getLogger("coordinator")
+_LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
 STORAGE_KEY = f"{DOMAIN}.occupancy_state"
+MAX_SOURCE_CLOCK_SKEW = 60.0
+
+
+def _valid_source_timestamp(source: float, received: float) -> bool:
+    """Reject corrupt or implausibly future source times."""
+    return (
+        math.isfinite(source)
+        and math.isfinite(received)
+        and source >= 0
+        and source <= received + MAX_SOURCE_CLOCK_SKEW
+    )
 
 
 class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
@@ -79,31 +91,88 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
     async def async_restore_occupancy(self) -> None:
         """Restore conservative indoor occupancy before sensor baselines."""
-        stored = await self._store.async_load()
+        try:
+            stored = await self._store.async_load()
+        except Exception as err:  # Store errors must fail safe.
+            _LOGGER.error(
+                "Could not restore occupancy state; leaving rooms unknown: %s", err
+            )
+            audit_event("occupancy_restore_failed", reason="store_error")
+            return
         if not stored:
+            _LOGGER.warning("No stored occupancy state; indoor rooms remain unknown")
+            audit_event(
+                "occupancy_restored",
+                status="missing",
+                possible=[],
+                cleared=[],
+                unknown=sorted(
+                    area_id for area_id, area in self.areas.items() if area.is_indoors
+                ),
+            )
             return
         if not isinstance(stored, dict):
             _LOGGER.warning("Ignoring invalid stored occupancy state")
+            audit_event("occupancy_restore_failed", reason="invalid_root")
             return
 
         stored_areas = stored.get("areas")
         if not isinstance(stored_areas, dict):
             _LOGGER.warning("Ignoring invalid stored occupancy state")
+            audit_event("occupancy_restore_failed", reason="invalid_areas")
             return
 
         restored: list[str] = []
+        cleared: list[str] = []
+        invalid_evidence: list[str] = []
         restore_time = time.time()
-        for area_id, area_data in stored_areas.items():
-            area = self.areas.get(area_id)
-            if not area or not area.is_indoors or not isinstance(area_data, dict):
+        legacy_store = stored.get("initialized") is not True
+        for area_id, area in self.areas.items():
+            if not area.is_indoors:
+                continue
+            area_data = stored_areas.get(area_id)
+            if not isinstance(area_data, dict):
                 continue
 
             last_motion = area_data.get("last_motion")
-            if isinstance(last_motion, (int, float)) and last_motion > 0:
+            if (
+                isinstance(last_motion, (int, float))
+                and not isinstance(last_motion, bool)
+                and math.isfinite(last_motion)
+                and 0 < last_motion <= restore_time + MAX_SOURCE_CLOCK_SKEW
+            ):
                 area.last_motion = float(last_motion)
+            elif last_motion not in (None, 0):
+                invalid_evidence.append(f"{area_id}.last_motion")
+            last_contact = area_data.get("last_contact")
+            if (
+                isinstance(last_contact, (int, float))
+                and not isinstance(last_contact, bool)
+                and math.isfinite(last_contact)
+                and 0 < last_contact <= restore_time + MAX_SOURCE_CLOCK_SKEW
+            ):
+                area.last_contact = float(last_contact)
+            elif last_contact not in (None, 0):
+                invalid_evidence.append(f"{area_id}.last_contact")
+
+            state = area_data.get("state")
+            if state == "unknown":
+                continue
+            if state == "cleared":
+                area.clear_occupancy(
+                    restore_time,
+                    reason=area_data.get("cleared_by") or "persisted_clear",
+                )
+                cleared.append(area_id)
+                continue
+            if state not in (None, "possible"):
+                _LOGGER.warning(
+                    "Ignoring invalid stored state for %s: %s", area_id, state
+                )
+                continue
             area.stale_since = restore_time
             area.cleared_by = None
-            area.occupied = True
+            area.apply_resolved_occupancy(True)
             self.occupancy_resolver.indoor_latched.add(area_id)
             restored.append(area_id)
 
@@ -112,23 +181,59 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 time.time(), restored, self.areas, self.sensors
             )
             _LOGGER.info("Restored occupied areas: %s", ", ".join(sorted(restored)))
-            self.data = self.diagnostics.get_system_status()
+        if cleared:
+            self.state_recorder.record_clear_event(
+                restore_time, cleared, self.areas, self.sensors
+            )
+            _LOGGER.info(
+                "Restored explicitly cleared areas: %s", ", ".join(sorted(cleared))
+            )
+        if legacy_store:
+            self._schedule_occupancy_save()
+        audit_event(
+            "occupancy_restored",
+            timestamp=restore_time,
+            status="legacy_migrated" if legacy_store else "current",
+            possible=sorted(restored),
+            cleared=sorted(cleared),
+            unknown=sorted(
+                area_id
+                for area_id, area in self.areas.items()
+                if area.is_indoors and not area.state_known
+            ),
+            invalid_evidence=sorted(invalid_evidence),
+        )
+        self.data = self.diagnostics.get_system_status()
 
     def _stored_occupancy(self) -> dict[str, Any]:
         """Build the minimal durable conservative-occupancy state."""
-        return {
-            "areas": {
-                area_id: {
-                    "last_motion": self.areas[area_id].last_motion,
+        areas: dict[str, dict[str, Any]] = {}
+        for area_id, area in sorted(self.areas.items()):
+            if not area.is_indoors:
+                continue
+            if area_id in self.occupancy_resolver.indoor_latched:
+                areas[area_id] = {
+                    "state": "possible",
+                    "last_motion": area.last_motion,
+                    "last_contact": area.last_contact,
                 }
-                for area_id in sorted(self.occupancy_resolver.indoor_latched)
-                if area_id in self.areas and self.areas[area_id].is_indoors
-            }
+            elif area.state_known:
+                areas[area_id] = {
+                    "state": "cleared",
+                    "last_motion": area.last_motion,
+                    "last_contact": area.last_contact,
+                    "cleared_by": area.cleared_by or "explicit_clear",
+                }
+            else:
+                areas[area_id] = {"state": "unknown"}
+        return {
+            "initialized": True,
+            "areas": areas,
         }
 
-    def _schedule_occupancy_save(self) -> None:
+    def _schedule_occupancy_save(self, delay: float = 0) -> None:
         """Persist a latch change without blocking sensor processing."""
-        self._store.async_delay_save(self._stored_occupancy)
+        self._store.async_delay_save(self._stored_occupancy, delay=delay)
 
     def _initialize_areas(self, config: OccupancyTrackerConfig) -> None:
         """Initialize area tracking objects from configuration."""
@@ -141,11 +246,38 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             self.sensors[sensor_id] = SensorState(sensor_id, sensor_config, time.time())
 
     def process_sensor_event(
-        self, sensor_id: str, state: bool, timestamp: float
+        self,
+        sensor_id: str,
+        state: bool,
+        timestamp: float,
+        received_timestamp: float | None = None,
     ) -> None:
         """Process a sensor state change event."""
+        received_at = (
+            received_timestamp if received_timestamp is not None else timestamp
+        )
+        if not _valid_source_timestamp(timestamp, received_at):
+            audit_event(
+                "sensor_event",
+                timestamp=received_at if math.isfinite(received_at) else None,
+                source_timestamp=(
+                    timestamp if math.isfinite(timestamp) else str(timestamp)
+                ),
+                sensor_id=sensor_id,
+                state=state,
+                decision="ignored_invalid_timestamp",
+            )
+            return
         if sensor_id not in self.sensors:
-            _LOGGER.warning(f"Unknown sensor ID: {sensor_id}")
+            _LOGGER.warning("Unknown sensor ID: %s", sensor_id)
+            audit_event(
+                "sensor_event",
+                timestamp=received_at,
+                source_timestamp=timestamp,
+                sensor_id=sensor_id,
+                state=state,
+                decision="ignored_unknown_sensor",
+            )
             return
 
         sensor = self.sensors[sensor_id]
@@ -154,8 +286,27 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         if isinstance(area_ids, str):
             area_ids = [area_ids]
 
+        if timestamp < sensor.last_source_timestamp:
+            audit_event(
+                "sensor_event",
+                timestamp=received_at,
+                source_timestamp=timestamp,
+                sensor_id=sensor_id,
+                sensor_type=sensor_type,
+                state=state,
+                areas=sorted(area_ids),
+                decision="ignored_out_of_order",
+                latest_source_timestamp=sensor.last_source_timestamp,
+            )
+            return
+
         old_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
         old_latched = set(self.occupancy_resolver.indoor_latched)
+        old_evidence = {
+            area_id: (area.last_motion, area.last_contact)
+            for area_id, area in self.areas.items()
+            if area.is_indoors
+        }
 
         was_available = sensor.is_available
         state_changed = sensor.update_state(state, timestamp)
@@ -169,6 +320,17 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             if not was_available:
                 self._record_sensor_availability(sensor_id, True, timestamp)
                 self.async_set_updated_data(self.diagnostics.get_system_status())
+            audit_event(
+                "sensor_event",
+                timestamp=received_at,
+                source_timestamp=timestamp,
+                sensor_id=sensor_id,
+                sensor_type=sensor_type,
+                state=state,
+                areas=sorted(area_ids),
+                decision="ignored_duplicate",
+                availability_recovered=not was_available,
+            )
             return
 
         snapshot = self._record_snapshot(sensor_id, state, timestamp)
@@ -180,8 +342,16 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
             if old_latched != self.occupancy_resolver.indoor_latched:
                 self._schedule_occupancy_save()
+            elif any(
+                old_evidence[area_id]
+                != (self.areas[area_id].last_motion, self.areas[area_id].last_contact)
+                for area_id in old_evidence
+            ):
+                self._schedule_occupancy_save(delay=30)
 
-            self._check_for_stuck_sensors(sensor_id, timestamp)
+            # Stuck duration is evaluated at receipt time. The source time may
+            # be an old HA startup state and is retained for evidence aging.
+            self._check_for_stuck_sensors(received_at)
 
             # Persist trust changes made by anomaly detection in this event's
             # replayable snapshot.
@@ -190,22 +360,100 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 sensor_id, sensor_type, state, area_ids, old_occupancy, timestamp
             )
 
-            self.last_event_time = timestamp
+            new_occupancy = {
+                area_id: area.occupancy for area_id, area in self.areas.items()
+            }
+            occupancy_changes = {
+                area_id: {"from": old_occupancy[area_id], "to": occupancy}
+                for area_id, occupancy in new_occupancy.items()
+                if old_occupancy[area_id] != occupancy
+            }
+            new_latched = self.occupancy_resolver.indoor_latched
+            audit_event(
+                "sensor_event",
+                timestamp=received_at,
+                source_timestamp=timestamp,
+                sensor_id=sensor_id,
+                sensor_type=sensor_type,
+                state=state,
+                areas=sorted(area_ids),
+                decision=(
+                    "accepted_transition" if state_changed else "accepted_keepalive"
+                ),
+                availability_recovered=not was_available,
+                trusted=sensor.is_trusted_active,
+                available=sensor.is_available,
+                reliable=sensor.is_reliable,
+                stuck=sensor.is_stuck,
+                occupancy_changes=occupancy_changes,
+                latches_added=sorted(new_latched - old_latched),
+                latches_removed=sorted(old_latched - new_latched),
+            )
+
+            self.last_event_time = received_at
             self.async_set_updated_data(self.diagnostics.get_system_status())
 
-    def invalidate_sensor_state(self, sensor_id: str, timestamp: float) -> None:
+    def invalidate_sensor_state(
+        self,
+        sensor_id: str,
+        timestamp: float,
+        received_timestamp: float | None = None,
+    ) -> None:
         """Stop trusting cached state without inventing a physical OFF edge."""
+        received_at = (
+            received_timestamp if received_timestamp is not None else timestamp
+        )
+        if not _valid_source_timestamp(timestamp, received_at):
+            audit_event(
+                "sensor_availability",
+                timestamp=received_at if math.isfinite(received_at) else None,
+                source_timestamp=(
+                    timestamp if math.isfinite(timestamp) else str(timestamp)
+                ),
+                sensor_id=sensor_id,
+                available=False,
+                decision="ignored_invalid_timestamp",
+            )
+            return
         sensor = self.sensors.get(sensor_id)
         if sensor is None:
             _LOGGER.warning("Unknown sensor ID: %s", sensor_id)
+            audit_event(
+                "sensor_availability",
+                timestamp=received_at,
+                source_timestamp=timestamp,
+                sensor_id=sensor_id,
+                available=False,
+                decision="ignored_unknown_sensor",
+            )
             return
 
         was_available = sensor.is_available
+        if timestamp < sensor.last_source_timestamp:
+            audit_event(
+                "sensor_availability",
+                timestamp=received_at,
+                source_timestamp=timestamp,
+                sensor_id=sensor_id,
+                available=False,
+                decision="ignored_out_of_order",
+                latest_source_timestamp=sensor.last_source_timestamp,
+            )
+            return
         sensor.mark_unavailable(timestamp)
         if was_available:
             self._record_sensor_availability(sensor_id, False, timestamp)
             self._refresh_after_trust_change(timestamp)
             self._refresh_latest_snapshot_state()
+        audit_event(
+            "sensor_availability",
+            timestamp=received_at,
+            source_timestamp=timestamp,
+            sensor_id=sensor_id,
+            available=False,
+            decision="invalidated" if was_available else "already_unavailable",
+        )
+        self.last_event_time = received_at
         self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def _refresh_after_trust_change(self, timestamp: float) -> None:
@@ -220,21 +468,59 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             ):
                 area.stale_since = timestamp
 
-    def seed_sensor_state(self, sensor_id: str, state: bool, timestamp: float) -> None:
+    def seed_sensor_state(
+        self,
+        sensor_id: str,
+        state: bool,
+        timestamp: float,
+        received_timestamp: float | None = None,
+    ) -> None:
         """Set an initial HA state without replaying it as a fresh edge."""
+        received_at = (
+            received_timestamp if received_timestamp is not None else timestamp
+        )
+        if not _valid_source_timestamp(timestamp, received_at):
+            audit_event(
+                "sensor_baseline",
+                timestamp=received_at if math.isfinite(received_at) else None,
+                source_timestamp=(
+                    timestamp if math.isfinite(timestamp) else str(timestamp)
+                ),
+                sensor_id=sensor_id,
+                state=state,
+                decision="ignored_invalid_timestamp",
+            )
+            return
         sensor = self.sensors.get(sensor_id)
         if sensor is None:
             _LOGGER.warning("Unknown sensor ID: %s", sensor_id)
-            return
-        sensor.seed_state(state, timestamp)
-        if state:
-            self.state_recorder.record_sensor_baseline(
-                timestamp=timestamp,
+            audit_event(
+                "sensor_baseline",
+                timestamp=received_at,
+                source_timestamp=timestamp,
                 sensor_id=sensor_id,
                 state=state,
-                areas=self.areas,
-                sensors=self.sensors,
+                decision="ignored_unknown_sensor",
             )
+            return
+        sensor.seed_state(state, timestamp)
+        self.state_recorder.record_sensor_baseline(
+            timestamp=timestamp,
+            sensor_id=sensor_id,
+            state=state,
+            areas=self.areas,
+            sensors=self.sensors,
+        )
+        audit_event(
+            "sensor_baseline",
+            timestamp=received_at,
+            source_timestamp=timestamp,
+            sensor_id=sensor_id,
+            sensor_type=sensor.config.get("type", ""),
+            state=state,
+            areas=sorted(sensor.area_ids),
+            decision="seeded",
+        )
 
     def _record_sensor_availability(
         self, sensor_id: str, available: bool, timestamp: float
@@ -285,29 +571,44 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             old_occupancy, new_occupancy
         )
 
-        state_view = self.log_formatter.format_state_view(self.areas, self.sensors)
-
         if changes:
-            _LOGGER.info(f"📍 {trigger} | {changes} | {state_view}")
+            _LOGGER.info("%s | %s", trigger, changes)
         else:
-            _LOGGER.info(f"📍 {trigger} | {state_view}")
+            _LOGGER.debug(
+                "%s | no occupancy change | type=%s source_timestamp=%.3f",
+                trigger,
+                sensor_type,
+                timestamp,
+            )
 
-    def _check_for_stuck_sensors(
-        self, triggered_sensor_id: str, timestamp: float
-    ) -> None:
-        """Check for stuck sensors when a sensor is triggered."""
+    def _check_for_stuck_sensors(self, timestamp: float) -> None:
+        """Check for stuck sensors and audit trust transitions."""
         trusted_before = {
             sensor_id: sensor.is_trusted_active
             for sensor_id, sensor in self.sensors.items()
         }
         self.anomaly_detector.check_for_stuck_sensors(
-            self.sensors, self.areas, triggered_sensor_id
+            self.sensors, self.areas, timestamp
         )
-        if any(
-            trusted_before[sensor_id] != sensor.is_trusted_active
+        trust_changes = {
+            sensor_id: {
+                "from": trusted_before[sensor_id],
+                "to": sensor.is_trusted_active,
+                "stuck": sensor.is_stuck,
+                "available": sensor.is_available,
+                "reliable": sensor.is_reliable,
+            }
             for sensor_id, sensor in self.sensors.items()
-        ):
+            if trusted_before[sensor_id] != sensor.is_trusted_active
+        }
+        if trust_changes:
             self._refresh_after_trust_change(timestamp)
+            self._refresh_latest_snapshot_state()
+            audit_event(
+                "sensor_trust_changed",
+                timestamp=timestamp,
+                sensors=trust_changes,
+            )
 
     def get_occupancy(self, area_id: str) -> int:
         """Get current occupancy count for an area."""
@@ -329,6 +630,8 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         area = self.areas.get(area_id)
         if area is None:
             return "vacant"
+        if not area.state_known:
+            return "unknown"
         if self.get_active_sensor_ids(area_id):
             return "active"
         if area_id in self.occupancy_resolver.indoor_latched:
@@ -348,20 +651,21 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         if area.occupancy <= 0:
             return 0.0
 
-        # Manually set occupancy has no motion timestamp.
+        # Missing evidence history is not full freshness.
         if area.last_motion == 0:
+            return 0.0
+
+        time_since_motion = max(0.0, now - area.last_motion)
+        scaled_time = time_since_motion / area.profile.freshness_scale
+
+        if scaled_time < 60:
             return 1.0
 
-        time_since_motion = now - area.last_motion
-
-        if time_since_motion < 60:
-            return 1.0
-
-        if time_since_motion < 300:
+        if scaled_time < 300:
             return 0.9
 
         k = 0.00021
-        decay_time = time_since_motion - 300
+        decay_time = scaled_time - 300
         freshness = 0.1 + 0.8 * math.exp(-k * decay_time)
 
         return round(freshness, 2)
@@ -378,6 +682,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         """Check for timeout conditions."""
         if timestamp is None:
             timestamp = time.time()
+        self._check_for_stuck_sensors(timestamp)
         self.anomaly_detector.check_timeouts(
             self.areas,
             timestamp,
@@ -409,8 +714,10 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
     def reset_anomalies(self) -> None:
         """Reset the anomaly detection system without resetting occupancy state."""
+        self.anomaly_detector.clear_warnings()
         self.anomaly_detector = AnomalyDetector(self.config)
         _LOGGER.info("Anomaly detection system reset")
+        audit_event("anomaly_detector_reset")
         self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def reset_warnings(self) -> None:
@@ -419,11 +726,23 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             _LOGGER.info("Active warnings cleared")
         self.async_set_updated_data(self.diagnostics.get_system_status())
 
-    def clear_stale_occupancy(self, area_ids: Iterable[str] | None = None) -> list[str]:
+    def clear_stale_occupancy(
+        self,
+        area_ids: Iterable[str] | None = None,
+        *,
+        actor: str = "direct",
+        reason: str = "manual_clear",
+    ) -> list[str]:
         """Clear conservatively latched rooms whose sensors are currently off."""
         timestamp = time.time()
+        if area_ids is None:
+            requested = None
+        elif isinstance(area_ids, str):
+            requested = [area_ids]
+        else:
+            requested = sorted(set(area_ids))
         cleared = self.occupancy_resolver.clear_stale_indoor_occupancy(
-            timestamp, self.areas, self.sensors, area_ids
+            timestamp, self.areas, self.sensors, requested, reason=reason
         )
         if cleared:
             self.state_recorder.record_clear_event(
@@ -431,12 +750,32 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             )
             self._schedule_occupancy_save()
             _LOGGER.info("Cleared stale occupancy: %s", ", ".join(sorted(cleared)))
+        audit_event(
+            "occupancy_clear",
+            timestamp=timestamp,
+            actor=actor,
+            reason=reason,
+            requested="all_indoor" if requested is None else requested,
+            cleared=sorted(cleared),
+            refused_active=sorted(
+                area_id
+                for area_id in (self.areas if requested is None else requested)
+                if self.get_active_sensor_ids(area_id)
+            ),
+            ignored_invalid=sorted(
+                area_id
+                for area_id in (requested or [])
+                if area_id not in self.areas or not self.areas[area_id].is_indoors
+            ),
+        )
         self.async_set_updated_data(self.diagnostics.get_system_status())
         return cleared
 
     def reset(self) -> None:
         """Reset the entire system state."""
-        had_latched_occupancy = bool(self.occupancy_resolver.indoor_latched)
+        had_durable_state = bool(self.occupancy_resolver.indoor_latched) or any(
+            area.is_indoors and area.state_known for area in self.areas.values()
+        )
         # Reset all areas using proper reset method
         for area in self.areas.values():
             area.reset()
@@ -448,28 +787,27 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         self.occupancy_resolver.reset()
 
         # Create new anomaly detector and state recorder
+        self.anomaly_detector.clear_warnings()
         self.anomaly_detector = AnomalyDetector(self.config)
         self.state_recorder.reset()
 
-        if had_latched_occupancy:
+        if had_durable_state:
             self._schedule_occupancy_save()
 
         _LOGGER.info("Occupancy tracker system reset")
+        audit_event(
+            "system_reset",
+            durable_state_reset=had_durable_state,
+        )
         self.async_set_updated_data(self.diagnostics.get_system_status())
 
-    def rebuild_from_history(self) -> None:
-        """Rebuild occupancy state from recorded history."""
-        history = self.state_recorder.get_history()
-        if not history:
-            return
+    def rebuild_from_history(self) -> bool:
+        """Compatibility alias for safe, non-mutating history verification.
 
-        self.occupancy_resolver.recalculate_from_history(
-            history,
-            self.areas,
-            self.sensors,
-            self.anomaly_detector,
-        )
-        self._refresh_latest_snapshot_state()
+        The recorder is intentionally bounded and therefore cannot be an
+        authoritative source for clearing durable occupancy.
+        """
+        return self.verify_history()
 
     def verify_history(self) -> bool:
         """Verify that replayed history matches without mutating live state."""

@@ -124,3 +124,22 @@ def test_check_timeouts_keeps_uncertain_indoor_latch():
 
     assert coordinator.areas["bathroom"].occupancy == 1
     assert "bathroom" in coordinator.occupancy_resolver.indoor_latched
+
+
+def test_periodic_check_marks_long_running_on_sensor_stuck():
+    """Stuck detection cannot depend on a different sensor firing later."""
+    hass = Mock(spec=HomeAssistant)
+    now = 200_000.0
+    config = {
+        "areas": {"hall": {}},
+        "adjacency": {},
+        "sensors": {"sensor.hall": {"area": "hall", "type": "motion"}},
+    }
+    coordinator = OccupancyCoordinator(hass, config, store=Mock())
+    coordinator.process_sensor_event("sensor.hall", True, now - 25 * 3600)
+
+    coordinator.check_timeouts(now)
+
+    assert coordinator.sensors["sensor.hall"].is_stuck is True
+    assert coordinator.sensors["sensor.hall"].is_reliable is False
+    assert any(w.type == "stuck_sensor" for w in coordinator.get_warnings())

@@ -73,6 +73,16 @@ class TestAreaOccupancyBinarySensor:
 
         assert sensor.is_on is False
 
+    def test_unknown_indoor_state_is_unavailable(self, coordinator):
+        """Missing durable state is not presented as confident vacancy."""
+        sensor = AreaOccupancyBinarySensor(coordinator, "bedroom")
+
+        assert sensor.available is False
+
+        coordinator.areas["bedroom"].clear_occupancy(1_000.0, reason="manual_clear")
+        assert sensor.available is True
+        assert sensor.is_on is False
+
     def test_attributes_include_count(self, coordinator):
         """Test attributes include occupancy count."""
         _set_occupancy(coordinator.areas["living_room"], 1)
@@ -189,6 +199,21 @@ class TestAreaActivityBinarySensor:
 
         assert sensor.is_on is False
         assert sensor.extra_state_attributes["activity_source"] == "none"
+
+    def test_recent_contact_is_activity_without_becoming_motion(self, coordinator):
+        area = coordinator.areas["living_room"]
+        area.record_contact(1_000.0, is_open=True)
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                "custom_components.occupancy_tracker.sensors.area_sensors.time.time",
+                lambda: 1_001.0,
+            )
+            assert sensor.is_on is True
+            assert sensor.extra_state_attributes["activity_source"] == "recent_contact"
+
+        assert area.last_motion == 0
 
     def test_identity_and_device_class(self, coordinator):
         sensor = AreaActivityBinarySensor(coordinator, "living_room")
