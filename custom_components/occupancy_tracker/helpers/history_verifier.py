@@ -142,8 +142,7 @@ class HistoryVerifier:
             )
             for sensor_id, sensor in sensors.items()
         }
-        original_latched = set(resolver.indoor_latched)
-        original_first_activation = resolver._first_activation_time
+        original_resolver_state = resolver.capture_state()
 
         try:
             resolver.recalculate_from_history(
@@ -187,9 +186,7 @@ class HistoryVerifier:
                     sensor.is_stuck,
                 ) = state
 
-            resolver.indoor_latched.clear()
-            resolver.indoor_latched.update(original_latched)
-            resolver._first_activation_time = original_first_activation
+            resolver.restore_state(original_resolver_state)
 
     def verify_all_snapshots(
         self,

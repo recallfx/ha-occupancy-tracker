@@ -23,19 +23,24 @@ areas:
   kitchen:
     name: Kitchen
     indoors: true
+    profile: living
   dining_room:
     name: Dining Room
     indoors: true
+    profile: living
   living:
     name: Living Room
     indoors: true
+    profile: living
   study:
     name: Study
     indoors: true
+    profile: living
   bedroom_2:
+    # Nursery. Daytime naps by an occupant who cannot leave unaided, so the
+    # long sleeping retention would only produce ghosts.
     name: Bedroom 2
     indoors: true
-    profile: sleeping
   bathroom:
     name: Bathroom
     indoors: true

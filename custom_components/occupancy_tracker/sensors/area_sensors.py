@@ -49,7 +49,16 @@ class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
         last_motion = area_state.last_motion
         time_since = round(now - last_motion) if last_motion > 0 else None
 
+        room = self.coordinator.get_room_state(self._area)
+
         return {
+            "state": room.get("state"),
+            "state_since": room.get("state_since"),
+            "reason": room.get("reason"),
+            "deadline": room.get("deadline"),
+            "confirmed": room.get("confirmed"),
+            "evidence_age": room.get("evidence_age"),
+            "exits": room.get("exits"),
             "occupancy_count": area_state.occupancy,
             "evidence_state": self.coordinator.get_occupancy_evidence(self._area),
             "active_sensors": self.coordinator.get_active_sensor_ids(self._area),

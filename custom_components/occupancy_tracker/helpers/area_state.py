@@ -65,6 +65,13 @@ class AreaState:
         if len(self.activity_history) > MAX_HISTORY_LENGTH:
             self.activity_history.pop(0)
 
+    def apply_engine_state(self, occupied: bool, known: bool) -> None:
+        """Apply an occupancy engine decision, including unknown evidence."""
+        self._occupied = occupied
+        self.state_known = known
+        if occupied:
+            self.last_occupied_at = self.last_motion or 0
+
     def apply_resolved_occupancy(self, occupied: bool) -> None:
         """Apply resolver output without turning uncertainty into vacancy."""
         self._occupied = occupied

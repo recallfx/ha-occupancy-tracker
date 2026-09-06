@@ -18,6 +18,7 @@ from .helpers.anomaly_detector import AnomalyDetector
 from .helpers.warning import Warning
 from .helpers.map_state_recorder import MapStateRecorder, MapSnapshot
 from .helpers.map_occupancy_resolver import MapOccupancyResolver
+from .helpers.occupancy_engine import STATE_VACANT
 from .helpers.area_state import AreaState
 from .helpers.sensor_state import SensorState
 from .helpers.history_verifier import HistoryVerifier
@@ -26,7 +27,9 @@ from .diagnostics import OccupancyDiagnostics
 
 _LOGGER = logging.getLogger(__name__)
 
-STORAGE_VERSION = 1
+# Version 1 held permanent indoor latches. They are not occupancy evidence and
+# are never imported; the migration drops them.
+STORAGE_VERSION = 2
 STORAGE_KEY = f"{DOMAIN}.occupancy_state"
 MAX_SOURCE_CLOCK_SKEW = 60.0
 
@@ -39,6 +42,27 @@ def _valid_source_timestamp(source: float, received: float) -> bool:
         and source >= 0
         and source <= received + MAX_SOURCE_CLOCK_SKEW
     )
+
+
+class OccupancyStore(Store[dict[str, Any]]):
+    """Storage that discards pre-state-machine payloads instead of migrating."""
+
+    async def _async_migrate_func(
+        self, old_major_version: int, old_minor_version: int, old_data: dict
+    ) -> dict[str, Any]:
+        """Drop older payloads: old latches must never become occupancy."""
+        _LOGGER.warning(
+            "Discarding occupancy state from storage version %s; rooms start from "
+            "live sensor evidence",
+            old_major_version,
+        )
+        audit_event(
+            "occupancy_storage_migrated",
+            from_version=old_major_version,
+            to_version=STORAGE_VERSION,
+            discarded=True,
+        )
+        return {"initialized": True, "rooms": {}}
 
 
 class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
@@ -77,7 +101,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         self.state_recorder = MapStateRecorder()
         self.occupancy_resolver = MapOccupancyResolver(config)
         self.log_formatter = LogFormatter(self.areas, self.sensors)
-        self._store = store or Store(
+        self._store = store or OccupancyStore(
             hass, STORAGE_VERSION, STORAGE_KEY, atomic_writes=True
         )
 
@@ -90,25 +114,21 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         return self.diagnostics.get_system_status()
 
     async def async_restore_occupancy(self) -> None:
-        """Restore conservative indoor occupancy before sensor baselines."""
+        """Restore per-room decision state before sensor baselines are seeded."""
         try:
             stored = await self._store.async_load()
         except Exception as err:  # Store errors must fail safe.
             _LOGGER.error(
-                "Could not restore occupancy state; leaving rooms unknown: %s", err
+                "Could not restore occupancy state; rooms start vacant: %s", err
             )
             audit_event("occupancy_restore_failed", reason="store_error")
             return
+
+        restore_time = time.time()
         if not stored:
-            _LOGGER.warning("No stored occupancy state; indoor rooms remain unknown")
+            _LOGGER.info("No stored occupancy state; rooms start from live evidence")
             audit_event(
-                "occupancy_restored",
-                status="missing",
-                possible=[],
-                cleared=[],
-                unknown=sorted(
-                    area_id for area_id, area in self.areas.items() if area.is_indoors
-                ),
+                "occupancy_restored", timestamp=restore_time, status="missing", rooms={}
             )
             return
         if not isinstance(stored, dict):
@@ -116,119 +136,43 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             audit_event("occupancy_restore_failed", reason="invalid_root")
             return
 
-        stored_areas = stored.get("areas")
-        if not isinstance(stored_areas, dict):
+        stored_rooms = stored.get("rooms")
+        if not isinstance(stored_rooms, dict):
             _LOGGER.warning("Ignoring invalid stored occupancy state")
-            audit_event("occupancy_restore_failed", reason="invalid_areas")
+            audit_event("occupancy_restore_failed", reason="invalid_rooms")
             return
 
-        restored: list[str] = []
-        cleared: list[str] = []
-        invalid_evidence: list[str] = []
-        restore_time = time.time()
-        legacy_store = stored.get("initialized") is not True
-        for area_id, area in self.areas.items():
-            if not area.is_indoors:
-                continue
-            area_data = stored_areas.get(area_id)
-            if not isinstance(area_data, dict):
-                continue
+        engine = self.occupancy_resolver.engine
+        rejected = engine.restore(
+            stored_rooms,
+            restore_time,
+            self.occupancy_resolver._compute_sensor_active_areas(self.sensors),
+            self.occupancy_resolver._compute_unavailable_areas(self.sensors),
+        )
+        self.occupancy_resolver._publish(restore_time, self.areas)
 
-            last_motion = area_data.get("last_motion")
-            if (
-                isinstance(last_motion, (int, float))
-                and not isinstance(last_motion, bool)
-                and math.isfinite(last_motion)
-                and 0 < last_motion <= restore_time + MAX_SOURCE_CLOCK_SKEW
-            ):
-                area.last_motion = float(last_motion)
-            elif last_motion not in (None, 0):
-                invalid_evidence.append(f"{area_id}.last_motion")
-            last_contact = area_data.get("last_contact")
-            if (
-                isinstance(last_contact, (int, float))
-                and not isinstance(last_contact, bool)
-                and math.isfinite(last_contact)
-                and 0 < last_contact <= restore_time + MAX_SOURCE_CLOCK_SKEW
-            ):
-                area.last_contact = float(last_contact)
-            elif last_contact not in (None, 0):
-                invalid_evidence.append(f"{area_id}.last_contact")
-
-            state = area_data.get("state")
-            if state == "unknown":
-                continue
-            if state == "cleared":
-                area.clear_occupancy(
-                    restore_time,
-                    reason=area_data.get("cleared_by") or "persisted_clear",
-                )
-                cleared.append(area_id)
-                continue
-            if state not in (None, "possible"):
-                _LOGGER.warning(
-                    "Ignoring invalid stored state for %s: %s", area_id, state
-                )
-                continue
-            area.stale_since = restore_time
-            area.cleared_by = None
-            area.apply_resolved_occupancy(True)
-            self.occupancy_resolver.indoor_latched.add(area_id)
-            restored.append(area_id)
-
-        if restored:
-            self.state_recorder.record_restore_event(
-                time.time(), restored, self.areas, self.sensors
-            )
-            _LOGGER.info("Restored occupied areas: %s", ", ".join(sorted(restored)))
-        if cleared:
-            self.state_recorder.record_clear_event(
-                restore_time, cleared, self.areas, self.sensors
-            )
-            _LOGGER.info(
-                "Restored explicitly cleared areas: %s", ", ".join(sorted(cleared))
-            )
-        if legacy_store:
-            self._schedule_occupancy_save()
+        occupied = sorted(
+            area_id for area_id, area in self.areas.items() if area.occupied
+        )
+        if occupied:
+            _LOGGER.info("Restored occupied areas: %s", ", ".join(occupied))
         audit_event(
             "occupancy_restored",
             timestamp=restore_time,
-            status="legacy_migrated" if legacy_store else "current",
-            possible=sorted(restored),
-            cleared=sorted(cleared),
-            unknown=sorted(
-                area_id
-                for area_id, area in self.areas.items()
-                if area.is_indoors and not area.state_known
-            ),
-            invalid_evidence=sorted(invalid_evidence),
+            status="current",
+            occupied=occupied,
+            rooms={
+                area_id: room.state for area_id, room in sorted(engine.rooms.items())
+            },
+            rejected=sorted(rejected),
         )
         self.data = self.diagnostics.get_system_status()
 
     def _stored_occupancy(self) -> dict[str, Any]:
-        """Build the minimal durable conservative-occupancy state."""
-        areas: dict[str, dict[str, Any]] = {}
-        for area_id, area in sorted(self.areas.items()):
-            if not area.is_indoors:
-                continue
-            if area_id in self.occupancy_resolver.indoor_latched:
-                areas[area_id] = {
-                    "state": "possible",
-                    "last_motion": area.last_motion,
-                    "last_contact": area.last_contact,
-                }
-            elif area.state_known:
-                areas[area_id] = {
-                    "state": "cleared",
-                    "last_motion": area.last_motion,
-                    "last_contact": area.last_contact,
-                    "cleared_by": area.cleared_by or "explicit_clear",
-                }
-            else:
-                areas[area_id] = {"state": "unknown"}
+        """Build the durable per-room decision state."""
         return {
             "initialized": True,
-            "areas": areas,
+            "rooms": self.occupancy_resolver.engine.snapshot(),
         }
 
     def _schedule_occupancy_save(self, delay: float = 0) -> None:
@@ -301,7 +245,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             return
 
         old_occupancy = {aid: area.occupancy for aid, area in self.areas.items()}
-        old_latched = set(self.occupancy_resolver.indoor_latched)
+        old_states = self._room_states()
         old_evidence = {
             area_id: (area.last_motion, area.last_contact)
             for area_id, area in self.areas.items()
@@ -340,7 +284,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 snapshot, self.areas, self.sensors, self.anomaly_detector
             )
 
-            if old_latched != self.occupancy_resolver.indoor_latched:
+            if old_states != self._room_states():
                 self._schedule_occupancy_save()
             elif any(
                 old_evidence[area_id]
@@ -368,7 +312,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 for area_id, occupancy in new_occupancy.items()
                 if old_occupancy[area_id] != occupancy
             }
-            new_latched = self.occupancy_resolver.indoor_latched
+            new_states = self._room_states()
             audit_event(
                 "sensor_event",
                 timestamp=received_at,
@@ -386,8 +330,11 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 reliable=sensor.is_reliable,
                 stuck=sensor.is_stuck,
                 occupancy_changes=occupancy_changes,
-                latches_added=sorted(new_latched - old_latched),
-                latches_removed=sorted(old_latched - new_latched),
+                room_transitions={
+                    area_id: {"from": old_states[area_id], "to": state}
+                    for area_id, state in new_states.items()
+                    if old_states[area_id] != state
+                },
             )
 
             self.last_event_time = received_at
@@ -457,16 +404,35 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def _refresh_after_trust_change(self, timestamp: float) -> None:
-        """Apply current trusted sensor state and mark quiet latches stale."""
+        """Re-run the engine after a sensor's trust or availability changed."""
         self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
-        for area_id in self.occupancy_resolver.indoor_latched:
-            area = self.areas.get(area_id)
-            if (
-                area
-                and not self.get_active_sensor_ids(area_id)
-                and area.stale_since is None
-            ):
-                area.stale_since = timestamp
+
+    def _room_states(self) -> Dict[str, str]:
+        """Return the current engine state of every room."""
+        return {
+            area_id: room.state
+            for area_id, room in self.occupancy_resolver.engine.rooms.items()
+        }
+
+    def get_room_state(self, area_id: str) -> Dict[str, Any]:
+        """Return the published decision state and its supporting evidence."""
+        engine = self.occupancy_resolver.engine
+        room = engine.rooms.get(area_id)
+        if room is None:
+            return {}
+        now = time.time()
+        last_own_on = room.last_own_on
+        return {
+            "state": engine.published_state(area_id, now),
+            "state_since": room.state_since or None,
+            "reason": room.reason,
+            "deadline": room.deadline,
+            "confirmed": room.confirmed,
+            "evidence_age": (
+                round(now - last_own_on, 1) if last_own_on is not None else None
+            ),
+            "exits": sorted(engine.exits_for(area_id)),
+        }
 
     def seed_sensor_state(
         self,
@@ -626,19 +592,10 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         )
 
     def get_occupancy_evidence(self, area_id: str) -> str:
-        """Explain why an area currently reports occupied or vacant."""
-        area = self.areas.get(area_id)
-        if area is None:
-            return "vacant"
-        if not area.state_known:
-            return "unknown"
-        if self.get_active_sensor_ids(area_id):
-            return "active"
-        if area_id in self.occupancy_resolver.indoor_latched:
-            return "stale"
-        if area.occupied:
-            return "inferred"
-        return "vacant"
+        """Return the room's decision state: the reason it reads as it does."""
+        if area_id not in self.areas:
+            return STATE_VACANT
+        return self.occupancy_resolver.engine.published_state(area_id)
 
     def get_occupancy_freshness(self, area_id: str, timestamp: float = None) -> float:
         """Get a time-since-motion freshness score from 0 to 1."""
@@ -679,10 +636,32 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         return self.anomaly_detector.get_warnings(active_only)
 
     def check_timeouts(self, timestamp: float = None) -> None:
-        """Check for timeout conditions."""
+        """Advance occupancy deadlines and run periodic diagnostics."""
         if timestamp is None:
             timestamp = time.time()
         self._check_for_stuck_sensors(timestamp)
+
+        # Vacancy has to be able to happen with no further sensor events, so
+        # the periodic tick is what actually retires holds and ceilings.
+        old_states = self._room_states()
+        self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
+        new_states = self._room_states()
+        if old_states != new_states:
+            self._schedule_occupancy_save()
+            audit_event(
+                "occupancy_tick",
+                timestamp=timestamp,
+                room_transitions={
+                    area_id: {
+                        "from": old_states[area_id],
+                        "to": state,
+                        "reason": self.occupancy_resolver.engine.rooms[area_id].reason,
+                    }
+                    for area_id, state in new_states.items()
+                    if old_states[area_id] != state
+                },
+            )
+
         self.anomaly_detector.check_timeouts(
             self.areas,
             timestamp,
@@ -773,8 +752,9 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
     def reset(self) -> None:
         """Reset the entire system state."""
-        had_durable_state = bool(self.occupancy_resolver.indoor_latched) or any(
-            area.is_indoors and area.state_known for area in self.areas.values()
+        had_durable_state = any(
+            room.state != STATE_VACANT
+            for room in self.occupancy_resolver.engine.rooms.values()
         )
         # Reset all areas using proper reset method
         for area in self.areas.values():
