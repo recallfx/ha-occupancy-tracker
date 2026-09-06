@@ -622,3 +622,165 @@ def test_snapshot_covers_indoor_rooms_only(engine: OccupancyEngine) -> None:
     stored = engine.snapshot()
     assert "yard" not in stored
     assert set(stored) == {"bedroom", "corridor", "ensuite", "living", "utility"}
+
+
+# ----------------------------------------------------------------------
+# Spill-timed re-activation of a held room
+# ----------------------------------------------------------------------
+
+
+def test_a_spilled_retrigger_of_a_pending_room_keeps_its_trail(
+    engine: OccupancyEngine,
+) -> None:
+    # Somebody leaves: the corridor fires while the bedroom's own detector is
+    # still ON, so a departure trail is on record and the room goes pending.
+    occupy(engine, "bedroom", T0)
+    occupy(engine, "corridor", T0 + 3, others=("bedroom",))
+    quiet(engine, T0 + 5, active=("corridor",))
+    quiet(engine, T0 + 10)
+    # They walk back past the door 20 s later and the corridor detector spills
+    # into the bedroom half a second after firing. That says nothing about a
+    # person in the bedroom, so the trail must survive it.
+    occupy(engine, "corridor", T0 + 30)
+    occupy(engine, "bedroom", T0 + 30.5, others=("corridor",))
+    room = engine.rooms["bedroom"]
+    assert room.state == STATE_PENDING
+    assert room.first_exit_edge == T0 + 3
+    quiet(engine, T0 + 35.5, active=("corridor",))
+    quiet(engine, T0 + 40)
+    engine.tick(T0 + 5 + HOLD)
+    assert room.state == STATE_VACANT
+    assert room.reason == "departure_trail"
+
+
+def test_a_spilled_retrigger_of_a_retained_room_keeps_its_ceiling(
+    engine: OccupancyEngine,
+) -> None:
+    occupy(engine, "bedroom", T0)
+    quiet(engine, T0 + 5)
+    engine.tick(T0 + 5 + HOLD)
+    room = engine.rooms["bedroom"]
+    assert room.state == STATE_RETAINED
+    ceiling = room.deadline
+    # A passer-by in the corridor spills into the sleeping room.
+    occupy(engine, "corridor", T0 + 600)
+    occupy(engine, "bedroom", T0 + 600.5, others=("corridor",))
+    assert room.state == STATE_RETAINED
+    quiet(engine, T0 + 606, active=("corridor",))
+    quiet(engine, T0 + 611)
+    engine.tick(T0 + 700)
+    assert room.state == STATE_RETAINED
+    assert room.deadline == ceiling
+
+
+def test_own_motion_after_an_ignored_spill_still_reoccupies(
+    engine: OccupancyEngine,
+) -> None:
+    occupy(engine, "bedroom", T0)
+    quiet(engine, T0 + 5)
+    occupy(engine, "corridor", T0 + 20)
+    occupy(engine, "bedroom", T0 + 20.5, others=("corridor",))
+    quiet(engine, T0 + 25.5, active=("corridor",))
+    quiet(engine, T0 + 30)
+    # The person inside moves once the corridor is quiet again.
+    occupy(engine, "bedroom", T0 + 40)
+    room = engine.rooms["bedroom"]
+    assert room.state == STATE_OCCUPIED
+    assert room.reason == "own_motion"
+    assert room.last_own_on == T0 + 40
+
+
+# ----------------------------------------------------------------------
+# A sensor that comes back from unavailable still ON is not a new edge
+# ----------------------------------------------------------------------
+
+
+def test_a_blip_while_leaving_keeps_the_departure_trail(
+    engine: OccupancyEngine,
+) -> None:
+    occupy(engine, "bedroom", T0)
+    occupy(engine, "corridor", T0 + 3, others=("bedroom",))
+    # The bedroom's input drops out for two seconds and returns still ON.
+    engine.apply(T0 + 4, {"corridor"}, {"bedroom"})
+    engine.apply(T0 + 6, {"bedroom", "corridor"})
+    room = engine.rooms["bedroom"]
+    assert room.state == STATE_OCCUPIED
+    assert room.reason == "own_motion_resumed"
+    assert room.last_own_on == T0
+    assert room.first_exit_edge == T0 + 3
+    quiet(engine, T0 + 8, active=("corridor",))
+    quiet(engine, T0 + 10)
+    engine.tick(T0 + 8 + HOLD)
+    assert room.state == STATE_VACANT
+    assert room.reason == "departure_trail"
+
+
+def test_a_blip_of_a_continuously_on_exit_manufactures_no_trail(
+    engine: OccupancyEngine,
+) -> None:
+    occupy(engine, "corridor", T0 - 40)
+    occupy(engine, "bedroom", T0 - 30, others=("corridor",))
+    quiet(engine, T0 + 5, active=("corridor",))
+    assert engine.rooms["bedroom"].first_exit_edge is None
+    # Every input drops out for eight seconds; the corridor returns still ON.
+    engine.apply(T0 + 10, set(), {"corridor", "bedroom"})
+    engine.apply(T0 + 18, {"corridor"})
+    engine.tick(T0 + 5 + HOLD)
+    room = engine.rooms["bedroom"]
+    assert room.first_exit_edge is None
+    assert room.state == STATE_RETAINED
+
+
+# ----------------------------------------------------------------------
+# Restart bookkeeping
+# ----------------------------------------------------------------------
+
+
+def test_restart_while_occupied_anchors_the_hold_on_the_live_activation(
+    engine: OccupancyEngine,
+) -> None:
+    occupy(engine, "bedroom", T0)
+    quiet(engine, T0 + 5)
+    occupy(engine, "bedroom", T0 + 20)
+    # The room is ON when the state is saved; the stored OFF is from the
+    # earlier episode and must not anchor anything.
+    stored = engine.snapshot()
+    fresh = OccupancyEngine(CONFIG, clock=lambda: T0 + 100)
+    fresh.restore(stored, T0 + 100, set())
+    room = fresh.rooms["bedroom"]
+    assert room.state == STATE_PENDING
+    assert room.deadline == T0 + 20 + HOLD
+
+
+def test_restart_while_occupied_keeps_a_trail_seen_before_shutdown(
+    engine: OccupancyEngine,
+) -> None:
+    occupy(engine, "bedroom", T0)
+    quiet(engine, T0 + 5)
+    occupy(engine, "bedroom", T0 + 3600)
+    occupy(engine, "corridor", T0 + 3603, others=("bedroom",))
+    stored = engine.snapshot()
+    fresh = OccupancyEngine(CONFIG, clock=lambda: T0 + 3700)
+    fresh.restore(stored, T0 + 3700, set())
+    room = fresh.rooms["bedroom"]
+    assert room.state == STATE_VACANT
+    assert room.reason == "departure_trail"
+
+
+def test_restore_on_a_running_engine_rederives_edges_from_the_live_set(
+    engine: OccupancyEngine,
+) -> None:
+    # A history replay restores into an engine that has already seen events.
+    occupy(engine, "bedroom", T0)
+    stored = {
+        "bedroom": {
+            "state": STATE_PENDING,
+            "state_since": T0 - 100,
+            "last_own_on": T0 - 110,
+            "last_own_off": T0 - 100,
+            "confirmed": True,
+            "deadline": T0 - 100 + HOLD,
+        }
+    }
+    engine.restore(stored, T0 + 1, {"bedroom"})
+    assert engine.rooms["bedroom"].state == STATE_OCCUPIED

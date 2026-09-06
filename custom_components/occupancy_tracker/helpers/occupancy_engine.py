@@ -54,6 +54,10 @@ class RoomRuntime:
     # hiding a trail that did happen.
     first_exit_edge: float | None = None
     unavailable_since: float | None = None
+    # A spill-timed activation of a room that is already held says nothing
+    # about whoever is inside, so it is ignored until its own OFF edge. Not
+    # persisted: after a restart the live sensor state decides afresh.
+    spill_ignored: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         """Return the JSON-serialisable form used for persistence."""
@@ -277,17 +281,23 @@ class OccupancyEngine:
         previous_on_edges = dict(self._last_on_edge)
         turned_on = active - previous_active
         turned_off = previous_active - active
+        # A sensor that went unavailable while ON and comes back still ON did
+        # not produce a new edge: the room resumes rather than re-enters.
+        resuming = {
+            area_id for area_id in turned_on if self._is_resuming(self.rooms[area_id])
+        }
+        edges = turned_on - resuming
 
         before = {area_id: room.state for area_id, room in self.rooms.items()}
 
-        for area_id in sorted(turned_on):
+        for area_id in sorted(edges):
             self._last_on_edge[area_id] = timestamp
         self._active = active
         self._unavailable = unavailable
 
         # Exit activations are recorded before rooms are advanced so a trail
         # observed in this same event is visible when a deadline fires.
-        for area_id in sorted(turned_on):
+        for area_id in sorted(edges):
             for room_id in self.topology[area_id].rooms_exited_by:
                 self._note_exit_edge(room_id, timestamp)
 
@@ -298,6 +308,7 @@ class OccupancyEngine:
                 active=area_id in active,
                 turned_on=area_id in turned_on,
                 turned_off=area_id in turned_off,
+                resuming=area_id in resuming,
                 unavailable=area_id in unavailable,
                 previous_active=previous_active,
                 previous_on_edges=previous_on_edges,
@@ -347,6 +358,7 @@ class OccupancyEngine:
         active: bool,
         turned_on: bool,
         turned_off: bool,
+        resuming: bool,
         unavailable: bool,
         previous_active: set[str],
         previous_on_edges: Mapping[str, float],
@@ -371,19 +383,36 @@ class OccupancyEngine:
                     timestamp,
                     "outdoor_active" if active else "outdoor_clear",
                 )
-            if turned_on:
+            if turned_on and not resuming:
                 room.last_own_on = timestamp
             if turned_off:
                 room.last_own_off = timestamp
             return
 
         if turned_on:
-            self._enter_occupied(
-                area_id, room, timestamp, previous_active, previous_on_edges
+            if resuming:
+                # The evidence never stopped; only the transport did. Keep the
+                # activation time and any trail already observed.
+                room.deadline = None
+                self._set_state(room, STATE_OCCUPIED, timestamp, "own_motion_resumed")
+                return
+            spilled = self._is_spill(
+                area_id, timestamp, previous_active, previous_on_edges
             )
+            if spilled and room.state in (STATE_PENDING, STATE_RETAINED):
+                # Rule 2: a spill-timed activation is not evidence of a person.
+                # For a room already held it must neither confirm the entry nor
+                # erase the trail that was observed, so the decision the room
+                # was already heading for stands. Its OFF edge is ignored too.
+                room.spill_ignored = True
+                return
+            self._enter_occupied(room, timestamp, spilled)
             return
 
         if turned_off:
+            if room.spill_ignored:
+                room.spill_ignored = False
+                return
             room.last_own_off = timestamp
             room.deadline = timestamp + area.profile.hold_seconds
             self._set_state(room, STATE_PENDING, timestamp, "hold")
@@ -400,13 +429,22 @@ class OccupancyEngine:
 
         self._evaluate_deadline(area_id, room, timestamp)
 
+    @staticmethod
+    def _is_resuming(room: RoomRuntime) -> bool:
+        """Return whether an ON edge is a sensor coming back from unavailable.
+
+        When a room's inputs go unavailable while ON, the room leaves the
+        active set and its OFF is recorded at that same instant. An ON edge
+        arriving while that marker is still in place is the same activation
+        reporting again, not a person arriving.
+        """
+        return (
+            room.unavailable_since is not None
+            and room.last_own_off == room.unavailable_since
+        )
+
     def _enter_occupied(
-        self,
-        area_id: str,
-        room: RoomRuntime,
-        timestamp: float,
-        previous_active: set[str],
-        previous_on_edges: Mapping[str, float],
+        self, room: RoomRuntime, timestamp: float, spilled: bool
     ) -> None:
         """Handle this room's own motion turning ON.
 
@@ -420,7 +458,6 @@ class OccupancyEngine:
         distinguishes spill is its lag, measured at 0.4 to 0.6 seconds, not
         whether the neighbour is still reporting.
         """
-        spilled = self._is_spill(area_id, timestamp, previous_active, previous_on_edges)
         if not spilled:
             # An activation that cannot be detector spill is a person.
             room.confirmed = True
@@ -562,6 +599,10 @@ class OccupancyEngine:
         """
         limit = now + 86400
         rejected: list[str] = []
+        # The stored rooms never saw this engine's edges. Seed as a cold engine
+        # would, so the pass below derives every edge from the live sets.
+        self._active = set()
+        self._last_on_edge = {}
         for area_id, raw in (stored_rooms or {}).items():
             area = self.topology.get(area_id)
             room = self.rooms.get(area_id)
@@ -590,8 +631,10 @@ class OccupancyEngine:
             room.reason = "restored"
 
             if state == STATE_OCCUPIED:
-                # Motion that is no longer live cannot keep a room occupied.
-                anchor = room.last_own_off or room.last_own_on or room.state_since
+                # Motion that is no longer live cannot keep a room occupied. The
+                # last evidence is the activation that was live at shutdown;
+                # any stored OFF belongs to an earlier episode.
+                anchor = room.last_own_on or room.state_since
                 room.last_own_off = anchor
                 room.state = STATE_PENDING
                 room.deadline = anchor + area.profile.hold_seconds
@@ -618,6 +661,7 @@ class OccupancyEngine:
             room.reason = "reset"
             room.first_exit_edge = None
             room.unavailable_since = None
+            room.spill_ignored = False
         self._active = set()
         self._unavailable = set()
         self._last_on_edge = {}
