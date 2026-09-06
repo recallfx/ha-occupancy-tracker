@@ -11,6 +11,7 @@ from custom_components.occupancy_tracker.helpers.audit import (
     AUDIT_LOGGER_NAME,
     audit_event,
 )
+from custom_components.occupancy_tracker.helpers.room_profiles import ROOM_PROFILES
 
 
 def _config():
@@ -94,24 +95,30 @@ async def test_sensor_audit_records_source_and_receipt_times(hass):
     assert event["source_timestamp"] == 100.0
     assert event["decision"] == "accepted_transition"
     assert event["occupancy_changes"] == {"corridor": {"from": 0, "to": 1}}
-    assert event["latches_added"] == ["corridor"]
+    assert event["room_transitions"] == {
+        "corridor": {"from": "vacant", "to": "occupied"}
+    }
 
 
 async def test_old_startup_on_state_is_immediately_untrusted_as_stuck(hass):
     coordinator = OccupancyCoordinator(hass, _config())
+    received = 100.0 + 25 * 3600
 
     coordinator.process_sensor_event(
         "binary_sensor.corridor_motion",
         True,
         timestamp=100.0,
-        received_timestamp=100.0 + 25 * 3600,
+        received_timestamp=received,
     )
 
     sensor = coordinator.sensors["binary_sensor.corridor_motion"]
     assert sensor.is_stuck is True
     assert sensor.is_reliable is False
-    # Positive evidence remains conservatively latched, but is no longer live.
-    assert coordinator.get_occupancy_evidence("corridor") == "stale"
+    # An untrusted sensor is not live motion, so the room holds instead.
+    assert coordinator.get_occupancy_evidence("corridor") == "pending"
+    # A corridor never retains, so the hold is all the room gets.
+    coordinator.check_timeouts(received + ROOM_PROFILES["transition"].hold_seconds)
+    assert coordinator.get_occupancy_evidence("corridor") == "vacant"
 
 
 async def test_clear_audit_records_actor_and_active_refusal(hass):

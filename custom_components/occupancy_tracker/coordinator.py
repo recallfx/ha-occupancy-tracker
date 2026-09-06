@@ -143,13 +143,14 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             return
 
         engine = self.occupancy_resolver.engine
-        rejected = engine.restore(
-            stored_rooms,
-            restore_time,
-            self.occupancy_resolver._compute_sensor_active_areas(self.sensors),
-            self.occupancy_resolver._compute_unavailable_areas(self.sensors),
+        rejected = self.occupancy_resolver.restore_occupancy(
+            stored_rooms, restore_time, self.areas, self.sensors
         )
-        self.occupancy_resolver._publish(restore_time, self.areas)
+        # Recording the restore keeps history verification honest: without it a
+        # replay of the bounded history cannot reproduce a restored room.
+        self.state_recorder.record_occupancy_restore(
+            restore_time, engine.snapshot(), self.areas, self.sensors
+        )
 
         occupied = sorted(
             area_id for area_id, area in self.areas.items() if area.occupied
@@ -406,6 +407,13 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
     def _refresh_after_trust_change(self, timestamp: float) -> None:
         """Re-run the engine after a sensor's trust or availability changed."""
         self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
+
+    def refresh_occupancy(self, timestamp: float | None = None) -> None:
+        """Recompute and publish occupancy from the current sensor evidence."""
+        if timestamp is None:
+            timestamp = time.time()
+        self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
+        self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def _room_states(self) -> Dict[str, str]:
         """Return the current engine state of every room."""

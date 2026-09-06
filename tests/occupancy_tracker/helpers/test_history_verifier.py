@@ -16,6 +16,7 @@ from custom_components.occupancy_tracker.helpers.history_verifier import (
     HistoryVerifier,
     StateDifference,
 )
+from custom_components.occupancy_tracker.helpers.occupancy_engine import STATE_RETAINED
 
 
 @pytest.fixture
@@ -233,7 +234,7 @@ async def test_coordinator_verify_history_deterministic(hass, config):
 
 @pytest.mark.asyncio
 async def test_coordinator_verify_history_preserves_state(hass, config):
-    """Verification must not mutate any live area, sensor, or latch state."""
+    """Verification must not mutate any live area, sensor, or room state."""
     coordinator = OccupancyCoordinator(hass, config)
 
     # Set up state
@@ -266,7 +267,7 @@ async def test_coordinator_verify_history_preserves_state(hass, config):
         sensor.is_reliable,
         sensor.is_stuck,
     )
-    original_latched = set(coordinator.occupancy_resolver.indoor_latched)
+    original_rooms = coordinator.occupancy_resolver.engine.snapshot()
     original_first_activation = coordinator.occupancy_resolver._first_activation_time
 
     # Verify (internally resets and replays)
@@ -291,7 +292,7 @@ async def test_coordinator_verify_history_preserves_state(hass, config):
         sensor.is_reliable,
         sensor.is_stuck,
     ) == original_sensor
-    assert coordinator.occupancy_resolver.indoor_latched == original_latched
+    assert coordinator.occupancy_resolver.engine.snapshot() == original_rooms
     assert (
         coordinator.occupancy_resolver._first_activation_time
         == original_first_activation
@@ -299,7 +300,7 @@ async def test_coordinator_verify_history_preserves_state(hass, config):
 
 
 def test_bounded_history_rebuild_cannot_mutate_live_occupancy(hass, config):
-    """Evicted restore evidence must never turn a consistency check into a clear."""
+    """Evicted history must never turn a consistency check into a clear."""
     coordinator = OccupancyCoordinator(hass, config, store=Mock())
     coordinator.state_recorder = MapStateRecorder(max_snapshots=2)
 
@@ -311,12 +312,13 @@ def test_bounded_history_rebuild_cannot_mutate_live_occupancy(hass, config):
         snapshot.description and "motion_a" in snapshot.description
         for snapshot in coordinator.state_recorder.get_history()
     )
-    original_latches = set(coordinator.occupancy_resolver.indoor_latched)
+    original_rooms = coordinator.occupancy_resolver.engine.snapshot()
 
     result = coordinator.rebuild_from_history()
 
     assert result is False
-    assert coordinator.occupancy_resolver.indoor_latched == original_latches
+    assert coordinator.occupancy_resolver.engine.snapshot() == original_rooms
+    assert coordinator.get_room_state("room_a")["state"] == STATE_RETAINED
     assert coordinator.get_occupancy("room_a") == 1
 
 
@@ -337,3 +339,45 @@ def test_state_difference_string_representation():
     assert "room_a" in str_repr
     assert "recorded=1" in str_repr
     assert "replayed=0" in str_repr
+
+
+@pytest.mark.asyncio
+async def test_verify_history_passes_after_restoring_a_held_room(hass, config):
+    """A restored room must not read as a replay mismatch.
+
+    Restored state comes from storage, not from the recorded events, so the
+    coordinator records the restore itself. Without that snapshot a replay can
+    never reproduce a restored room and verification reports a false failure.
+    """
+    now = time.time()
+    store = Mock()
+
+    async def _load():
+        return {
+            "initialized": True,
+            "rooms": {
+                "room_a": {
+                    "state": STATE_RETAINED,
+                    "state_since": now - 600,
+                    "last_own_on": now - 900,
+                    "last_own_off": now - 800,
+                    "confirmed": True,
+                    "deadline": now + 3600,
+                    "reason": "no_exit_trail",
+                    "first_exit_edge": None,
+                }
+            },
+        }
+
+    store.async_load = _load
+    store.async_delay_save = Mock()
+
+    coordinator = OccupancyCoordinator(hass, config, store=store)
+    await coordinator.async_restore_occupancy()
+    assert coordinator.occupancy_resolver.engine.rooms["room_a"].state == STATE_RETAINED
+
+    coordinator.process_sensor_event("motion_b", True, now)
+    coordinator.process_sensor_event("motion_b", False, now + 1)
+
+    assert coordinator.verify_history() is True
+    assert coordinator.occupancy_resolver.engine.rooms["room_a"].state == STATE_RETAINED

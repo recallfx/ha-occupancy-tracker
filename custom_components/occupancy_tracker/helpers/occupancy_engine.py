@@ -408,7 +408,18 @@ class OccupancyEngine:
         previous_active: set[str],
         previous_on_edges: Mapping[str, float],
     ) -> None:
-        """Handle this room's own motion turning ON."""
+        """Handle this room's own motion turning ON.
+
+        Rule 2 of the design says a further own activation confirms a spilled
+        entry "after the neighbour has gone quiet". This is deliberately looser:
+        it confirms once the activation is more than the spill window past the
+        neighbour's own activation, even while the neighbour is still ON. The
+        detectors hold ON for about five seconds after the last motion they see,
+        so waiting for the neighbour to go quiet would refuse to confirm the
+        ordinary case of somebody walking out of the corridor into a room. What
+        distinguishes spill is its lag, measured at 0.4 to 0.6 seconds, not
+        whether the neighbour is still reporting.
+        """
         spilled = self._is_spill(area_id, timestamp, previous_active, previous_on_edges)
         if not spilled:
             # An activation that cannot be detector spill is a person.
@@ -445,7 +456,18 @@ class OccupancyEngine:
         return False
 
     def _note_exit_edge(self, area_id: str, timestamp: float) -> None:
-        """Remember the first exit activation since this room's own activity."""
+        """Remember the first exit activation since this room's own activity.
+
+        Rule 4 qualifies the trail only by timing, so any exit activation in the
+        window counts. Detector overlap runs both ways, and a replay over three
+        months of recorded events shows the cost: 60% of bedroom_1's trail
+        releases fire on a corridor_2 edge whose lag from bedroom_1's own edge
+        has a median of 0.39 s, which is spill rather than someone walking out.
+        Qualifying the trail the way rule 2 qualifies entry needs a threshold of
+        its own -- the lag distributions separate near 0.75 s, not at the 2 s
+        spill window -- so it is left as a measured follow-up rather than a
+        silent change to the rule.
+        """
         room = self.rooms.get(area_id)
         if room is None or room.last_own_on is None:
             return

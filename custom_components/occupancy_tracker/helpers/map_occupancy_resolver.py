@@ -88,6 +88,23 @@ class MapOccupancyResolver:
         self._publish(timestamp, areas)
         return cleared
 
+    def restore_occupancy(
+        self,
+        stored_rooms: dict[str, Any],
+        timestamp: float,
+        areas: Dict[str, AreaState],
+        sensors: Dict[str, SensorState],
+    ) -> list[str]:
+        """Seed the engine from persisted state and publish the result."""
+        rejected = self.engine.restore(
+            stored_rooms,
+            timestamp,
+            self._compute_sensor_active_areas(sensors),
+            self._compute_unavailable_areas(sensors),
+        )
+        self._publish(timestamp, areas)
+        return rejected
+
     # ------------------------------------------------------------------
     # Verification support
     # ------------------------------------------------------------------
@@ -241,6 +258,12 @@ class MapOccupancyResolver:
         anomaly_detector: Optional[AnomalyDetector] = None,
     ) -> Optional[str]:
         """Apply a single snapshot event to update occupancy state."""
+        if snapshot.event_type == "restore":
+            # Restored state is the one thing a bounded history cannot derive
+            # from its own events, so a replay has to be re-seeded with it.
+            self.restore_occupancy(snapshot.rooms, snapshot.timestamp, areas, sensors)
+            return None
+
         cleared_area_ids = self._parse_clear_event(snapshot)
         if cleared_area_ids:
             self.clear_stale_indoor_occupancy(

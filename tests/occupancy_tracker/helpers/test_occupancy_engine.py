@@ -182,7 +182,10 @@ def test_no_trail_retains_the_room(engine: OccupancyEngine) -> None:
 
 def test_trail_window_boundary(engine: OccupancyEngine) -> None:
     trail_window = engine.trail_window
-    for offset, expected in ((trail_window, STATE_VACANT), (trail_window + 1, STATE_RETAINED)):
+    for offset, expected in (
+        (trail_window, STATE_VACANT),
+        (trail_window + 1, STATE_RETAINED),
+    ):
         engine = OccupancyEngine(CONFIG, clock=lambda: T0)
         occupy(engine, "bedroom", T0)
         quiet(engine, T0 + 5)
@@ -246,7 +249,11 @@ def test_retention_ceiling_releases_the_room(engine: OccupancyEngine) -> None:
 
 @pytest.mark.parametrize(
     ("area", "ceiling"),
-    [("bedroom", SLEEPING_CEILING), ("living", LIVING_CEILING), ("utility", DEFAULT_CEILING)],
+    [
+        ("bedroom", SLEEPING_CEILING),
+        ("living", LIVING_CEILING),
+        ("utility", DEFAULT_CEILING),
+    ],
 )
 def test_ceilings_come_from_the_room_profile(area: str, ceiling: int) -> None:
     engine = OccupancyEngine(CONFIG, clock=lambda: T0)

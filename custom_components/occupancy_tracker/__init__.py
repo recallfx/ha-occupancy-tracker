@@ -315,6 +315,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     received_timestamp=startup_timestamp,
                 )
 
+        # Seeding an OFF baseline publishes nothing on its own, so without this
+        # every room would read unavailable until the first interval tick.
+        coordinator.refresh_occupancy(startup_timestamp)
+
         audit_event(
             "startup_baseline_complete",
             timestamp=startup_timestamp,

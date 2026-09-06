@@ -11,7 +11,18 @@ from custom_components.occupancy_tracker import (
     async_setup,
     DOMAIN,
 )
-from custom_components.occupancy_tracker.coordinator import OccupancyCoordinator
+from custom_components.occupancy_tracker.coordinator import (
+    STORAGE_KEY,
+    STORAGE_VERSION,
+    OccupancyCoordinator,
+)
+from custom_components.occupancy_tracker.helpers.constants import (
+    UNAVAILABLE_GRACE_SECONDS,
+)
+from custom_components.occupancy_tracker.helpers.room_profiles import ROOM_PROFILES
+
+HOLD = ROOM_PROFILES["default"].hold_seconds
+CEILING = ROOM_PROFILES["default"].retention_ceiling_seconds
 
 
 @pytest.fixture
@@ -70,9 +81,10 @@ class TestAsyncSetup:
         data = await coordinator._async_update_data()
 
         assert data["occupied_areas"] == {}
+        # With no stored decision and no events yet, rooms start vacant.
         assert data["area_evidence"] == {
-            "living_room": "unknown",
-            "kitchen": "unknown",
+            "living_room": "vacant",
+            "kitchen": "vacant",
         }
 
     async def test_setup_seeds_current_on_sensor_state(
@@ -87,15 +99,27 @@ class TestAsyncSetup:
         assert coordinator.sensors["binary_sensor.motion_living"].current_state is True
         assert coordinator.get_occupancy("living_room") == 1
 
-    @patch("custom_components.occupancy_tracker.coordinator.Store")
-    async def test_setup_restores_quiet_indoor_occupancy_before_sensor_baselines(
+    @patch("custom_components.occupancy_tracker.coordinator.OccupancyStore")
+    async def test_setup_restores_a_held_room_before_sensor_baselines(
         self, mock_store_class, hass: HomeAssistant, sample_config
     ):
-        """A stored quiet room must survive restart even when its PIR is OFF."""
+        """A stored held room must survive restart even when its PIR is OFF."""
         store = mock_store_class.return_value
-        stored_motion = time.time() - 3600
+        stored_off = time.time() - 3600
         store.async_load = AsyncMock(
-            return_value={"areas": {"living_room": {"last_motion": stored_motion}}}
+            return_value={
+                "initialized": True,
+                "rooms": {
+                    "living_room": {
+                        "state": "retained",
+                        "state_since": stored_off + HOLD,
+                        "last_own_on": stored_off - 5,
+                        "last_own_off": stored_off,
+                        "confirmed": True,
+                        "deadline": stored_off + CEILING,
+                    }
+                },
+            }
         )
         hass.states.async_set("binary_sensor.motion_living", STATE_OFF)
 
@@ -104,15 +128,20 @@ class TestAsyncSetup:
         coordinator = hass.data[DOMAIN]["coordinator"]
         assert store.async_load.await_count >= 1
         assert coordinator.get_occupancy("living_room") == 1
-        assert "living_room" in coordinator.occupancy_resolver.indoor_latched
-        assert coordinator.areas["living_room"].last_motion == stored_motion
-        assert coordinator.verify_history() is True
+        room = coordinator.get_room_state("living_room")
+        assert room["state"] == "retained"
+        # A restart never grants a fresh hold: the ceiling keeps its wall clock.
+        assert room["deadline"] == stored_off + CEILING
+        # Restore is not a recorded event, so a bounded replay cannot explain
+        # the room. Verification must still leave it alone.
+        coordinator.verify_history()
+        assert coordinator.get_occupancy("living_room") == 1
 
-    @patch("custom_components.occupancy_tracker.coordinator.Store")
-    async def test_indoor_latch_and_newer_evidence_are_persisted(
+    @patch("custom_components.occupancy_tracker.coordinator.OccupancyStore")
+    async def test_room_decision_state_is_persisted_per_room(
         self, mock_store_class, hass: HomeAssistant, sample_config
     ):
-        """New positive evidence is durable even after the room is already latched."""
+        """Every durable decision change is written back per room."""
         store = mock_store_class.return_value
         store.async_load = AsyncMock(return_value=None)
         coordinator = OccupancyCoordinator(hass, sample_config[DOMAIN])
@@ -121,28 +150,35 @@ class TestAsyncSetup:
 
         coordinator.process_sensor_event("binary_sensor.motion_living", True, timestamp)
 
-        assert coordinator.get_occupancy_evidence("living_room") == "active"
+        assert coordinator.get_occupancy_evidence("living_room") == "occupied"
         assert store.async_delay_save.call_count == 1
         data_func = store.async_delay_save.call_args.args[0]
-        assert data_func()["areas"]["living_room"] == {
-            "state": "possible",
-            "last_motion": timestamp,
-            "last_contact": 0,
+        assert data_func()["rooms"]["living_room"] == {
+            "state": "occupied",
+            "state_since": timestamp,
+            "last_own_on": timestamp,
+            "last_own_off": None,
+            "confirmed": True,
+            "deadline": None,
+            "reason": "own_motion",
+            "first_exit_edge": None,
         }
 
         coordinator.process_sensor_event(
             "binary_sensor.motion_living", False, timestamp + 5
         )
-        assert coordinator.get_occupancy_evidence("living_room") == "stale"
+        assert coordinator.get_occupancy_evidence("living_room") == "pending"
         assert coordinator.areas["living_room"].stale_since == timestamp + 5
-        assert store.async_delay_save.call_count == 1
+        assert store.async_delay_save.call_count == 2
+        data_func = store.async_delay_save.call_args.args[0]
+        assert data_func()["rooms"]["living_room"]["deadline"] == timestamp + 5 + HOLD
 
         coordinator.process_sensor_event(
             "binary_sensor.motion_living", True, timestamp + 100
         )
-        assert store.async_delay_save.call_count == 2
+        assert store.async_delay_save.call_count == 3
         data_func = store.async_delay_save.call_args.args[0]
-        assert data_func()["areas"]["living_room"]["last_motion"] == timestamp + 100
+        assert data_func()["rooms"]["living_room"]["last_own_on"] == timestamp + 100
 
         coordinator.process_sensor_event(
             "binary_sensor.motion_living", False, timestamp + 105
@@ -150,38 +186,88 @@ class TestAsyncSetup:
         coordinator.clear_stale_occupancy()
         assert coordinator.get_occupancy_evidence("living_room") == "vacant"
         assert coordinator.areas["living_room"].cleared_by == "manual_clear"
-        assert store.async_delay_save.call_count == 3
         data_func = store.async_delay_save.call_args.args[0]
-        assert data_func()["areas"]["living_room"]["state"] == "cleared"
+        assert data_func()["rooms"]["living_room"]["state"] == "vacant"
 
-    @patch("custom_components.occupancy_tracker.coordinator.Store")
-    async def test_missing_store_keeps_indoor_occupancy_unknown(
+    async def test_version_one_latches_are_never_imported(
+        self, hass: HomeAssistant, sample_config, hass_storage
+    ):
+        """The migration discards the permanent latches of storage version 1."""
+        assert STORAGE_VERSION == 2
+        hass_storage[STORAGE_KEY] = {
+            "version": 1,
+            "key": STORAGE_KEY,
+            "data": {
+                "initialized": True,
+                "areas": {
+                    "living_room": {"state": "possible", "last_motion": 1.0},
+                    "kitchen": {"state": "possible", "last_motion": 1.0},
+                },
+            },
+        }
+        coordinator = OccupancyCoordinator(hass, sample_config[DOMAIN])
+
+        await coordinator.async_restore_occupancy()
+
+        assert coordinator.get_occupancy("living_room") == 0
+        assert coordinator.get_occupancy("kitchen") == 0
+        assert coordinator.get_occupancy_evidence("living_room") == "vacant"
+
+    @patch("custom_components.occupancy_tracker.coordinator.OccupancyStore")
+    async def test_missing_store_starts_rooms_from_live_evidence(
         self, mock_store_class, hass: HomeAssistant, sample_config
     ):
-        """Storage loss must not be presented as confident vacancy."""
+        """Storage loss starts rooms vacant rather than importing occupancy."""
         store = mock_store_class.return_value
         store.async_load = AsyncMock(return_value=None)
         coordinator = OccupancyCoordinator(hass, sample_config[DOMAIN])
 
         await coordinator.async_restore_occupancy()
 
-        assert coordinator.get_occupancy_evidence("living_room") == "unknown"
+        assert coordinator.get_occupancy_evidence("living_room") == "vacant"
+        assert coordinator.get_occupancy("living_room") == 0
+
+    async def test_unavailable_motion_inputs_publish_unknown_never_off(
+        self, hass: HomeAssistant, sample_config
+    ):
+        """A room with no usable motion evidence is unknown, not off."""
+        await async_setup(hass, sample_config)
+        coordinator = hass.data[DOMAIN]["coordinator"]
+        entity_id = "binary_sensor.motion_living"
+
+        hass.states.async_set(entity_id, STATE_ON)
+        await hass.async_block_till_done()
+        hass.states.async_set(entity_id, STATE_UNAVAILABLE)
+        await hass.async_block_till_done()
+
+        blind_until = time.time() + UNAVAILABLE_GRACE_SECONDS
+        coordinator.check_timeouts(blind_until)
+
+        engine = coordinator.occupancy_resolver.engine
+        assert engine.published_state("living_room", blind_until) == "unknown"
+        assert engine.rooms["living_room"].state != "vacant"
         assert coordinator.areas["living_room"].state_known is False
 
-    @patch("custom_components.occupancy_tracker.coordinator.Store")
-    async def test_future_persisted_evidence_cannot_poison_freshness(
+    @patch("custom_components.occupancy_tracker.coordinator.OccupancyStore")
+    async def test_corrupt_persisted_room_state_is_rejected(
         self, mock_store_class, hass: HomeAssistant, sample_config
     ):
-        """Corrupt future evidence is ignored while safe occupancy is retained."""
+        """Future evidence is dropped and a pre-state-machine state is refused."""
         store = mock_store_class.return_value
+        far_future = time.time() + 2 * 86400
         store.async_load = AsyncMock(
             return_value={
                 "initialized": True,
-                "areas": {
+                "rooms": {
                     "living_room": {
-                        "state": "possible",
-                        "last_motion": time.time() + 86400,
-                    }
+                        "state": "retained",
+                        "state_since": far_future,
+                        "last_own_on": far_future,
+                        "last_own_off": far_future,
+                        "confirmed": True,
+                        "deadline": time.time() + 600,
+                    },
+                    "kitchen": {"state": "possible"},
                 },
             }
         )
@@ -192,45 +278,61 @@ class TestAsyncSetup:
         ) as audit:
             await coordinator.async_restore_occupancy()
 
+        assert audit.call_args.kwargs["rejected"] == ["kitchen"]
+        assert coordinator.get_occupancy("kitchen") == 0
         assert coordinator.get_occupancy("living_room") == 1
+        assert coordinator.get_room_state("living_room")["evidence_age"] is None
         assert coordinator.areas["living_room"].last_motion == 0
         assert coordinator.get_occupancy_freshness("living_room") == 0
-        assert audit.call_args.kwargs["invalid_evidence"] == ["living_room.last_motion"]
 
-    @patch("custom_components.occupancy_tracker.coordinator.Store")
-    async def test_reset_persists_unknown_after_an_explicit_clear(
+    @patch("custom_components.occupancy_tracker.coordinator.OccupancyStore")
+    async def test_reset_persists_vacancy_so_a_stored_hold_cannot_reappear(
         self, mock_store_class, hass: HomeAssistant, sample_config
     ):
-        """A reset must not allow an older persisted clear to reappear."""
+        """A reset must not allow an older persisted hold to reappear."""
         store = mock_store_class.return_value
         coordinator = OccupancyCoordinator(hass, sample_config[DOMAIN])
-        coordinator.clear_stale_occupancy(["living_room"])
+        timestamp = time.time()
+        coordinator.process_sensor_event("binary_sensor.motion_living", True, timestamp)
+        coordinator.process_sensor_event(
+            "binary_sensor.motion_living", False, timestamp + 5
+        )
         store.async_delay_save.reset_mock()
 
         coordinator.reset()
 
         assert store.async_delay_save.call_count == 1
         data_func = store.async_delay_save.call_args.args[0]
-        assert data_func()["areas"]["living_room"] == {"state": "unknown"}
+        assert data_func()["rooms"]["living_room"] == {
+            "state": "vacant",
+            "state_since": 0.0,
+            "last_own_on": None,
+            "last_own_off": None,
+            "confirmed": False,
+            "deadline": None,
+            "reason": "reset",
+            "first_exit_edge": None,
+        }
 
-    async def test_persisted_latch_round_trip_and_clear(
+    async def test_persisted_hold_round_trip_and_clear(
         self, hass: HomeAssistant, sample_config
     ):
-        """Real Home Assistant storage restores and removes a quiet latch."""
+        """Real Home Assistant storage restores and removes a quiet hold."""
         timestamp = time.time()
         first = OccupancyCoordinator(hass, sample_config[DOMAIN])
         await first.async_restore_occupancy()
         first.process_sensor_event("binary_sensor.motion_living", True, timestamp)
         first.process_sensor_event("binary_sensor.motion_living", False, timestamp + 5)
-        first.areas["living_room"].record_contact(timestamp + 2, is_open=True)
         await first._store.async_save(first._stored_occupancy())
 
         restored = OccupancyCoordinator(hass, sample_config[DOMAIN])
         await restored.async_restore_occupancy()
 
         assert restored.get_occupancy("living_room") == 1
-        assert restored.areas["living_room"].last_motion == timestamp
-        assert restored.areas["living_room"].last_contact == timestamp + 2
+        room = restored.get_room_state("living_room")
+        assert room["state"] == "pending"
+        # The hold keeps the deadline that the original evidence earned.
+        assert room["deadline"] == timestamp + 5 + HOLD
 
         restored.clear_stale_occupancy()
         await restored._store.async_save(restored._stored_occupancy())
@@ -238,9 +340,7 @@ class TestAsyncSetup:
         after_clear = OccupancyCoordinator(hass, sample_config[DOMAIN])
         await after_clear.async_restore_occupancy()
         assert after_clear.get_occupancy("living_room") == 0
-        assert after_clear.areas["living_room"].last_motion == timestamp
-        assert after_clear.areas["living_room"].last_contact == timestamp + 2
-        assert after_clear.areas["living_room"].cleared_by == "manual_clear"
+        assert after_clear.get_room_state("living_room")["state"] == "vacant"
 
     async def test_clear_stale_occupancy_service_targets_one_room(
         self, hass: HomeAssistant, sample_config
