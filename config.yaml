@@ -177,6 +177,8 @@ sensors:
     type: motion
 
   # Magnetic Sensors (doors/windows)
+  # Group address 8/2/6, "Entrance m na" in ETS. Never fired in 91 days of
+  # recorded events; which door it belongs to is unverified.
   binary_sensor.entrance_magnet:
     area: [entrance, frontyard]
     type: magnetic
@@ -198,8 +200,11 @@ sensors:
   binary_sensor.utility_magnet:
     area: [utility_room, left_side]
     type: magnetic
+  # Group address 8/2/11 is labelled "Entrance m" in ETS, and over 91 days 79%
+  # of its pulses coincide with the entrance detector against 0.9% with the
+  # workshop's. Home Assistant names it Workshop Magnet; it is the front door.
   binary_sensor.workshop_magnet:
-    area: [workshop, right_side]
+    area: [entrance, frontyard]
     type: magnetic
   binary_sensor.bedroom_2_magnet:
     area: [bedroom_2, frontyard]
