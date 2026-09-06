@@ -1,14 +1,16 @@
 [project]
 name = "occupancy_tracker"
 version = "0.0.0"
-requires-python = ">=3.12"
+requires-python = ">=3.14.2"
 dependencies = [
-    "homeassistant==2024.12.5",
+    "homeassistant==2026.8.3",
     "pytest>=8.3.3",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "pytest-homeassistant-custom-component>=0.13.45",
-    "ruff>=0.8.0",
+    # Pinned below 0.10 so this change does not also carry a linter upgrade;
+    # 0.16 reports 243 pre-existing findings across the tree.
+    "ruff>=0.8.0,<0.10",
     "syrupy>=4.0.0",
 ]
 
@@ -20,7 +22,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 ignore_errors = true
 follow_imports = "silent"
 ignore_missing_imports = true
