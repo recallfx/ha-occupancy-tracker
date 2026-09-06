@@ -21,11 +21,12 @@ import time
 
 from freezegun.api import FrozenDateTimeFactory
 from homeassistant.const import (
+    EVENT_STATE_CHANGED,
     STATE_OFF,
     STATE_ON,
     STATE_UNAVAILABLE,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.setup import async_setup_component
 import pytest
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
@@ -35,6 +36,7 @@ from custom_components.occupancy_tracker.const import (
     SERVICE_CLEAR_STALE_OCCUPANCY,
 )
 from custom_components.occupancy_tracker.coordinator import (
+    PUBLISH_INTERVAL_SECONDS,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -580,3 +582,33 @@ async def test_the_clear_button_empties_the_stale_rooms(
     state = house.states.get(occupancy("main_bedroom"))
     assert state.state == STATE_OFF
     assert state.attributes["reason"] == "manual_button"
+
+
+async def test_a_quiet_tick_does_not_republish_every_entity(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+):
+    """Time-derived attributes refresh once a minute, not on every tick.
+
+    Every publish is a recorder row for every entity, and the tick moved from
+    60 s to 10 s when it became the path that retires deadlines. A transition
+    still publishes at once; a quiet tick waits for the minute.
+    """
+    await setup_house(hass, freezer)
+    await enter_and_settle(hass, freezer, "kitchen")
+    await advance(hass, freezer, TICK)
+
+    events: list[str] = []
+
+    @callback
+    def record(event) -> None:
+        if event.data["entity_id"] == occupancy("kitchen"):
+            events.append(event.data["new_state"].state)
+
+    hass.bus.async_listen(EVENT_STATE_CHANGED, record)
+
+    for _ in range(3):
+        await advance(hass, freezer, TICK)
+    assert events == []
+
+    await advance(hass, freezer, PUBLISH_INTERVAL_SECONDS)
+    assert events == [STATE_ON]

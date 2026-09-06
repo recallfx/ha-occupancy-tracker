@@ -32,6 +32,10 @@ _LOGGER = logging.getLogger(__name__)
 STORAGE_VERSION = 2
 STORAGE_KEY = f"{DOMAIN}.occupancy_state"
 MAX_SOURCE_CLOCK_SKEW = 60.0
+# The entities carry time-derived attributes, so every publish is a recorder
+# row for every entity. A quiet tick refreshes them at the old one-minute
+# cadence; a transition publishes at once.
+PUBLISH_INTERVAL_SECONDS = 60.0
 
 
 def _valid_source_timestamp(source: float, received: float) -> bool:
@@ -91,6 +95,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         )
         self.config = config
         self.last_event_time = time.time()
+        self._last_periodic_publish = 0.0
 
         self.areas: Dict[str, AreaState] = {}
         self.sensors: Dict[str, SensorState] = {}
@@ -422,6 +427,13 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             for area_id, room in self.occupancy_resolver.engine.rooms.items()
         }
 
+    def _published_states(self) -> Dict[str, tuple[bool, bool]]:
+        """Return what every area currently publishes: (occupied, known)."""
+        return {
+            area_id: (area.occupied, area.state_known)
+            for area_id, area in self.areas.items()
+        }
+
     def get_room_state(self, area_id: str) -> Dict[str, Any]:
         """Return the published decision state and its supporting evidence."""
         engine = self.occupancy_resolver.engine
@@ -647,11 +659,12 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         """Advance occupancy deadlines and run periodic diagnostics."""
         if timestamp is None:
             timestamp = time.time()
+        old_states = self._room_states()
+        published_before = self._published_states()
         self._check_for_stuck_sensors(timestamp)
 
         # Vacancy has to be able to happen with no further sensor events, so
         # the periodic tick is what actually retires holds and ceilings.
-        old_states = self._room_states()
         self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
         new_states = self._room_states()
         if old_states != new_states:
@@ -670,6 +683,7 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                 },
             )
 
+        warnings_before = len(self.get_warnings())
         self.anomaly_detector.check_timeouts(
             self.areas,
             timestamp,
@@ -681,8 +695,17 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             self.areas,
             self.sensors,
         )
-        # Always update data to reflect freshness decay.
-        self.async_set_updated_data(self.diagnostics.get_system_status())
+        changed = (
+            old_states != new_states
+            or self._published_states() != published_before
+            or len(self.get_warnings()) != warnings_before
+        )
+        if (
+            changed
+            or timestamp - self._last_periodic_publish >= PUBLISH_INTERVAL_SECONDS
+        ):
+            self._last_periodic_publish = timestamp
+            self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def resolve_warning(self, warning_id: str) -> bool:
         """Resolve a specific warning by ID."""
