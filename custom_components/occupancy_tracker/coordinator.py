@@ -118,8 +118,13 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         """Return current state when a coordinator entity requests a refresh."""
         return self.diagnostics.get_system_status()
 
-    async def async_restore_occupancy(self) -> None:
-        """Restore per-room decision state before sensor baselines are seeded."""
+    async def async_restore_occupancy(self, *, evaluate: bool = True) -> None:
+        """Restore per-room decision state before sensor baselines are seeded.
+
+        With ``evaluate=False`` the rooms are seeded but not decided, because
+        the active and unavailable sets are only real once the baselines are
+        in. Integration setup then calls :meth:`refresh_occupancy`.
+        """
         try:
             stored = await self._store.async_load()
         except Exception as err:  # Store errors must fail safe.
@@ -149,8 +154,11 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
         engine = self.occupancy_resolver.engine
         rejected = self.occupancy_resolver.restore_occupancy(
-            stored_rooms, restore_time, self.areas, self.sensors
+            stored_rooms, restore_time, self.areas, self.sensors, evaluate=evaluate
         )
+        # The restore pass changes room state, so it has to persist like any
+        # other change; otherwise a restart followed by a crash could lose it.
+        self._schedule_occupancy_save()
         # Recording the restore keeps history verification honest: without it a
         # replay of the bounded history cannot reproduce a restored room.
         self.state_recorder.record_occupancy_restore(
@@ -411,13 +419,20 @@ class OccupancyCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
 
     def _refresh_after_trust_change(self, timestamp: float) -> None:
         """Re-run the engine after a sensor's trust or availability changed."""
+        old_states = self._room_states()
         self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
+        # Losing an input can move a room into a hold, which is durable state.
+        if old_states != self._room_states():
+            self._schedule_occupancy_save()
 
     def refresh_occupancy(self, timestamp: float | None = None) -> None:
         """Recompute and publish occupancy from the current sensor evidence."""
         if timestamp is None:
             timestamp = time.time()
+        old_states = self._room_states()
         self.occupancy_resolver.refresh_occupancy(timestamp, self.areas, self.sensors)
+        if old_states != self._room_states():
+            self._schedule_occupancy_save()
         self.async_set_updated_data(self.diagnostics.get_system_status())
 
     def _room_states(self) -> Dict[str, str]:

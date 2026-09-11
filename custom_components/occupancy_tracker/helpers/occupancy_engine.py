@@ -589,6 +589,8 @@ class OccupancyEngine:
         now: float,
         active_areas: Iterable[str],
         unavailable_areas: Iterable[str] = (),
+        *,
+        evaluate: bool = True,
     ) -> list[str]:
         """Seed from persisted state, then re-evaluate everything against now.
 
@@ -596,6 +598,12 @@ class OccupancyEngine:
         original wall clock, and a room stored as occupied but no longer
         active resumes the hold that its last evidence had earned. Anything
         already expired is released in the same pass.
+
+        With ``evaluate=False`` the pass seeds the rooms and stops. Home
+        Assistant startup needs that: no sensor baseline has been read yet, so
+        both sets are still empty and a stored room whose inputs are dead
+        would be judged available and inactive. The caller runs the first
+        evaluation after the baseline pass, with the live sets.
         """
         limit = now + 86400
         rejected: list[str] = []
@@ -642,7 +650,8 @@ class OccupancyEngine:
                 anchor = room.last_own_off or room.state_since
                 room.deadline = anchor + area.profile.hold_seconds
 
-        self.apply(now, active_areas, unavailable_areas)
+        if evaluate:
+            self.apply(now, active_areas, unavailable_areas)
         # Home Assistant replays its startup baselines after this, carrying the
         # sensors' real last-changed times. Those are older than now and must
         # not be clamped forward, or genuine entries look like detector spill.

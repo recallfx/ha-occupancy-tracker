@@ -210,7 +210,11 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # Create the coordinator instance.
     coordinator = OccupancyCoordinator(hass, occupancy_config)
-    await coordinator.async_restore_occupancy()
+    # Seed the stored rooms only. Nothing has read a sensor yet, so the active
+    # and unavailable sets are both empty and a stored room whose inputs are
+    # dead would look available and inactive; the first evaluation runs below,
+    # once the baselines are in.
+    await coordinator.async_restore_occupancy(evaluate=False)
 
     # Store the coordinator
     hass.data[DOMAIN] = {"coordinator": coordinator}
@@ -275,13 +279,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
 
     # Set up state listeners for each sensor entity defined in the occupancy config.
+    startup_timestamp = time.time()
     sensor_entities = list(occupancy_config.get("sensors", {}).keys())
     if sensor_entities:
         async_track_state_change_event(hass, sensor_entities, state_change_listener)
 
         # Restore states already present when the integration starts. Motion ON
         # is live occupancy evidence; other states are only cached baselines.
-        startup_timestamp = time.time()
         startup_states = []
         for position, entity_id in enumerate(sensor_entities):
             state = hass.states.get(entity_id)
@@ -315,10 +319,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     received_timestamp=startup_timestamp,
                 )
 
-        # Seeding an OFF baseline publishes nothing on its own, so without this
-        # every room would read unavailable until the first interval tick.
-        coordinator.refresh_occupancy(startup_timestamp)
+    # The restore pass deferred its evaluation, so this is the first one and it
+    # runs with the baseline's real active and unavailable sets. Seeding an OFF
+    # baseline also publishes nothing on its own, so without this every room
+    # would read unavailable until the first interval tick.
+    coordinator.refresh_occupancy(startup_timestamp)
 
+    if sensor_entities:
         audit_event(
             "startup_baseline_complete",
             timestamp=startup_timestamp,

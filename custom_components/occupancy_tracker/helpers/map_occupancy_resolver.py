@@ -94,13 +94,20 @@ class MapOccupancyResolver:
         timestamp: float,
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
+        *,
+        evaluate: bool = True,
     ) -> list[str]:
-        """Seed the engine from persisted state and publish the result."""
+        """Seed the engine from persisted state and publish the result.
+
+        With ``evaluate=False`` the engine is only seeded; the caller runs the
+        first evaluation once the sensor baselines are in.
+        """
         rejected = self.engine.restore(
             stored_rooms,
             timestamp,
             self._compute_sensor_active_areas(sensors),
             self._compute_unavailable_areas(sensors),
+            evaluate=evaluate,
         )
         self._publish(timestamp, areas)
         return rejected

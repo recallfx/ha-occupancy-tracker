@@ -767,6 +767,27 @@ def test_restart_while_occupied_keeps_a_trail_seen_before_shutdown(
     assert room.reason == "departure_trail"
 
 
+def test_restore_lets_startup_baselines_keep_their_own_times(
+    engine: OccupancyEngine,
+) -> None:
+    """BEHAVIOR.md section 3.3: restore returns the monotonic clamp to zero.
+
+    Home Assistant replays its startup baselines after the restore, carrying
+    each sensor's real `last_changed`. Those times are older than the restore,
+    so the clamp has to be back at zero. Otherwise every baseline is stamped
+    at the restore time, the lag between a corridor edge and a room edge
+    collapses to nothing, and a genuine entry reads as detector spill.
+    """
+    engine.restore({}, T0, set())
+
+    engine.apply(T0 - 50, {"corridor"})
+    engine.apply(T0 - 40, {"corridor", "bedroom"})
+
+    room = engine.rooms["bedroom"]
+    assert room.confirmed is True
+    assert room.reason == "own_motion"
+
+
 def test_restore_on_a_running_engine_rederives_edges_from_the_live_set(
     engine: OccupancyEngine,
 ) -> None:

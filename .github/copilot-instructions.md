@@ -16,7 +16,7 @@ Home Assistant integration for room occupancy and short-lived activity tracking.
 - `AnomalyDetector` (`helpers/anomaly_detector.py`): Generates warnings for stuck sensors, impossible movements, and timeouts. Diagnostics only, except that a sensor ON for 24 h is marked unreliable.
 - `MapStateRecorder`: Captures immutable snapshots for history replay.
 
-**Key principle**: A room is released only by evidence of leaving. Own motion occupies it; when its inputs fall silent it is held for `hold_seconds`; at that deadline it goes vacant if an exit neighbour, or its own door contact, fired after the room's last activation (a departure trail), otherwise it is retained until own motion or the profile's retention ceiling. Neighbour motion alone never clears a room. Adjacency defines exits; a neighbour whose only indoor connection is the room itself is a dead end, not an exit. The design and its evidence are in `output/occupancy-handoff-2026-09-06.md` in the parent workspace.
+**Key principle**: A room is released only by evidence of leaving; `BEHAVIOR.md` section 6 is the binding rule text (note the 30 s trail window). `BEHAVIOR.md` in the repository root is the binding specification: read it before changing behavior, and change it first when behavior must change. The design evidence is in the parent workspace's `output/`.
 
 ## Configuration
 
@@ -27,7 +27,7 @@ occupancy_tracker:
   areas:
     living_room:
       name: "Living Room"
-      exit_capable: false  # informational
+      exit_capable: false  # diagnostics only; see BEHAVIOR.md section 4
       indoors: true        # false for yards, porches
       profile: living      # transition, default, living, sleeping
   adjacency:
@@ -73,7 +73,7 @@ CI also runs the full suite against Home Assistant 2026.8.3/Python 3.14, matchin
 
 ## Simulation
 
-Interactive web UI for testing: `python -m simulation.server` then open http://localhost:8080
+Interactive web UI for testing: `python -m simulation.server` then open http://localhost:8123
 
 Uses `SimOccupancyCoordinator` wrapping the real coordinator, loads from `config.yaml`.
 
@@ -81,7 +81,7 @@ Uses `SimOccupancyCoordinator` wrapping the real coordinator, loads from `config
 
 - The ten-second tick is load-bearing: it is the only path that retires holds and ceilings. It publishes entities only on a change, else once a minute, because the entities carry time-derived attributes and every publish is a recorder row per entity.
 - Adjacency is auto-bidirectional and defines exits.
-- `exit_capable` is informational. Outdoor areas mirror their sensors and are never exits.
+- `exit_capable` affects diagnostics only: it enables `exit_area_stale` on an outdoor area, suppresses `phantom_occupancy_suspected`, and makes every activation of the area plausible, so `unexpected_motion` never fires for it. See `BEHAVIOR.md` section 4. Outdoor areas mirror their sensors and are never exits.
 - `indoors` defaults to true; set false for outdoor areas.
 - Sensor entity IDs must match HA format (`binary_sensor.xyz`).
 - State is mutable - `MapOccupancyResolver` modifies `AreaState` objects directly.
@@ -97,35 +97,20 @@ Write like a human. Avoid flowery language, summary phrases, vague statements, a
 
 Document significant decisions, findings, and context that future sessions need to know. Most recent entries first.
 
+### 2026-09-10: BEHAVIOR.md is the binding specification
+- `BEHAVIOR.md` in the repository root now specifies the behavior in words and diagrams. Read it first; change it before changing behavior. `CLAUDE.md` carries the same instruction.
+- `ARCHITECTURE.md` and `README.md` had described the removed permanent latch and contradicted the shipped engine on every rule. Both were corrected; `ARCHITECTURE.md` is now a component map only.
+- A conformance review against the specification passed on every checked rule. Open code deviations are listed in `BEHAVIOR.md` section 15; the report is `output/occupancy-conformance-2026-09-10.md` in the parent workspace.
+- Known defect found in that pass: a door or window seeded ON at startup reads as stuck at once, because `SensorState.seed_state` leaves `last_changed` at zero. Diagnostic only.
+
 ### 2026-09-07: Exit-gated state machine replaces the latch
 - `OccupancyEngine` decides occupancy per room with explicit deadlines; the permanent indoor latch is gone. Storage version 2 discards the old latches.
 - A spill-timed re-trigger of a held room is ignored, and an availability recovery is a continuation, so neither can erase a departure trail or re-anchor a ceiling.
 - Known open item: a departure trail is not spill-qualified (see `_note_exit_edge`). Fixing it needs a threshold of its own; the replay numbers are in the parent workspace's `output/`.
 - `binary_sensor.workshop_magnet` (KNX 8/2/11) is the front door and is mapped to the entrance.
 
-### 2026-08-07: Conservative profiles, persistence, and audit
-- Added transition/living/sleeping profiles for activity, freshness, and diagnostic decay without weakening durable occupancy.
-- Missing persistence now stays unknown; explicit clears and possible occupancy survive restart with motion/contact evidence.
-- Contacts no longer fabricate motion, warning predicates resolve, stuck sensors are checked periodically, and old events cannot rewind newer sensor state.
-- Added concise operational logging, structured JSONL audit, and a CI gate matching production Home Assistant 2026.7.3.
-
-### 2025-12-20: Activation-Window Refactor
-- Refactored `MapOccupancyResolver` to use an activation-window model.
-- Movement now happens on **Motion-OFF** if a neighbor activated after the source turned ON.
-- **Motion-ON** now only records entry and checks for plausible sources (anomalies).
-- Periodic consistency checks disabled to simplify logic and improve predictability.
-- Added `indoors` config for areas to better detect outdoor-to-indoor intrusions.
-
-### 2025-12-20: Simulation reset control
-- Added simulation reset command via WebSocket and UI button in the simulator header
-- Reset flow clears backend areas/sensors/history and resets local draggable people/input system (exits history mode first)
-- Use the "Reset State" button (requires active WS connection)
-
-### 2024-11-26: Instructions file created
-- Established architecture documentation with core flow, components, and patterns
-- Key insight: `MapOccupancyResolver` is stateless and mutates `AreaState` in-place
-- The old `AreaManager`/`SensorManager` classes no longer exist - coordinator owns state directly
-- Motion-OFF logic is critical: person STAYS by default, only moves with explicit evidence
+### Before 2026-08: superseded designs
+- A permanent indoor latch and an activation-window movement model preceded the engine; both are gone. See git history.
 
 ### Template for new entries
 ```

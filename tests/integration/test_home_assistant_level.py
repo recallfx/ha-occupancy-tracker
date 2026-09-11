@@ -205,6 +205,50 @@ async def test_every_room_publishes_a_state_before_the_first_tick(
         assert state.state == STATE_OFF, area_id
 
 
+#: A cut-down house whose area ids do not match their display names.
+RENAMED_HOUSE = {
+    DOMAIN: {
+        "areas": {
+            "guest_room": {"name": "Guest Toilet", "indoors": True},
+            "entrance": {"name": "Entrance", "indoors": True},
+        },
+        "adjacency": {"guest_room": ["entrance"]},
+        "sensors": {
+            "binary_sensor.guest_room_motion": {
+                "area": "guest_room",
+                "type": "motion",
+            },
+            "binary_sensor.entrance_motion": {"area": "entrance", "type": "motion"},
+        },
+    }
+}
+
+
+async def test_the_entity_id_comes_from_the_area_name_not_the_area_id(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+):
+    """BEHAVIOR.md section 1: the object id is slugified from ``name:``.
+
+    The shipped configuration names `guest_room` Guest Toilet, so consumers
+    have to address `binary_sensor.guest_toilet_occupancy`. Every other test
+    in this file uses names that slugify back to their own area id, which
+    hides the difference.
+    """
+    for sensor_id in RENAMED_HOUSE[DOMAIN]["sensors"]:
+        hass.states.async_set(sensor_id, STATE_OFF)
+    await hass.async_block_till_done()
+
+    assert await async_setup_component(hass, DOMAIN, RENAMED_HOUSE)
+    await hass.async_block_till_done()
+    await advance(hass, freezer, TICK + 1)
+
+    assert hass.states.get("binary_sensor.guest_toilet_occupancy") is not None
+    assert hass.states.get("binary_sensor.guest_toilet_activity") is not None
+    assert hass.states.get("binary_sensor.guest_room_occupancy") is None
+    # An area whose name slugifies back to its id is unaffected.
+    assert hass.states.get("binary_sensor.entrance_occupancy") is not None
+
+
 async def test_a_quiet_house_never_starts_occupied(house: HomeAssistant):
     # The old storage held permanent latches. A room now starts from live
     # sensor evidence, and every detector is reporting off.
@@ -480,6 +524,61 @@ async def test_a_restart_releases_a_room_whose_ceiling_expired(
     await setup_house(hass, freezer)
 
     state = hass.states.get(occupancy("kitchen"))
+    assert state.state == STATE_OFF
+    assert state.attributes["reason"] == "retention_ceiling"
+
+
+async def test_a_restart_does_not_release_a_stored_room_whose_input_is_down(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, hass_storage
+):
+    """BEHAVIOR.md sections 9.2 and 9.3: the first evaluation waits for the sets.
+
+    The store is read before any sensor has been, so a restore that decided
+    there and then would judge every stored room available and inactive, and
+    release a room whose only detector is dead. The room must read
+    ``unavailable`` after the grace instead, which is what section 8 asks for.
+    """
+    now = time.time()
+    hass_storage[STORAGE_KEY] = _stored(
+        {
+            "bedroom_1": {
+                "state": "retained",
+                # The ceiling ran out while Home Assistant was down, so a
+                # restore that evaluated on empty sets would release the room.
+                "state_since": now - SLEEPING_CEILING - 3600,
+                "last_own_on": now - SLEEPING_CEILING - 3700,
+                "last_own_off": now - SLEEPING_CEILING - 3600,
+                "confirmed": True,
+                "deadline": now - 3600,
+                "reason": "no_exit_trail",
+                "first_exit_edge": None,
+            }
+        }
+    )
+    for sensor_id in SENSORS:
+        hass.states.async_set(
+            sensor_id,
+            STATE_UNAVAILABLE
+            if sensor_id == "binary_sensor.bedroom_1_motion"
+            else STATE_OFF,
+        )
+    await hass.async_block_till_done()
+
+    assert await async_setup_component(hass, DOMAIN, HOUSE)
+    await hass.async_block_till_done()
+    await advance(hass, freezer, TICK + 1)
+
+    engine = hass.data[DOMAIN]["coordinator"].occupancy_resolver.engine
+    assert engine.rooms["bedroom_1"].state == "retained"
+
+    await advance(hass, freezer, UNAVAILABLE_GRACE_SECONDS + TICK)
+    assert hass.states.get(occupancy("bedroom_1")).state == STATE_UNAVAILABLE
+    assert engine.rooms["bedroom_1"].state == "retained"
+
+    # The detector comes back quiet, and the frozen ceiling resolves.
+    await set_sensor(hass, "binary_sensor.bedroom_1_motion", STATE_OFF)
+    await advance(hass, freezer, TICK)
+    state = hass.states.get(occupancy("bedroom_1"))
     assert state.state == STATE_OFF
     assert state.attributes["reason"] == "retention_ceiling"
 

@@ -189,6 +189,33 @@ class TestAsyncSetup:
         data_func = store.async_delay_save.call_args.args[0]
         assert data_func()["rooms"]["living_room"]["state"] == "vacant"
 
+    @patch("custom_components.occupancy_tracker.coordinator.OccupancyStore")
+    async def test_losing_a_rooms_only_input_persists_the_hold_it_starts(
+        self, mock_store_class, hass: HomeAssistant, sample_config
+    ):
+        """An availability change is a room state change, so it is saved.
+
+        BEHAVIOR.md section 9.1 promises a save on every room state change.
+        Invalidating the room's only motion input drops the area out of the
+        active set, which starts a hold; that hold has to survive a restart.
+        """
+        store = mock_store_class.return_value
+        store.async_load = AsyncMock(return_value=None)
+        coordinator = OccupancyCoordinator(hass, sample_config[DOMAIN])
+        await coordinator.async_restore_occupancy()
+        timestamp = time.time()
+        coordinator.process_sensor_event("binary_sensor.motion_living", True, timestamp)
+        store.async_delay_save.reset_mock()
+
+        coordinator.invalidate_sensor_state(
+            "binary_sensor.motion_living", timestamp + 1
+        )
+
+        assert coordinator.get_occupancy_evidence("living_room") == "pending"
+        assert store.async_delay_save.call_count == 1
+        data_func = store.async_delay_save.call_args.args[0]
+        assert data_func()["rooms"]["living_room"]["state"] == "pending"
+
     async def test_version_one_latches_are_never_imported(
         self, hass: HomeAssistant, sample_config, hass_storage
     ):
