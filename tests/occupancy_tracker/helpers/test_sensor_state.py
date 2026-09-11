@@ -18,6 +18,8 @@ class TestSensorState:
         assert sensor.config == config
         assert sensor.current_state is False
         assert sensor.last_changed == 0  # Only set by real state changes
+        assert sensor.last_update_time == timestamp
+        assert sensor.last_source_timestamp == 0
         assert sensor.history == []
         assert sensor.is_reliable is True
         assert sensor.is_stuck is False
@@ -118,6 +120,7 @@ class TestSensorState:
         assert sensor.last_changed == 0
         assert sensor.activated_at is None
         assert sensor.last_update_time == 0
+        assert sensor.last_source_timestamp == 0
         assert sensor.history == []
         assert sensor.is_available is True
 

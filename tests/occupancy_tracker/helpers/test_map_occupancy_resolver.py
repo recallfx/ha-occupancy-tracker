@@ -806,8 +806,8 @@ def test_adjacency_bidirectional():
 # ============================================================
 
 
-def test_magnetic_event_updates_last_motion():
-    """Magnetic events update last_motion on linked areas."""
+def test_magnetic_event_records_contact_without_faking_motion():
+    """A boundary edge is activity, but not fabricated PIR evidence."""
     now = time.time()
     config = {
         "areas": {"hall": {}, "room": {}},
@@ -828,8 +828,14 @@ def test_magnetic_event_updates_last_motion():
 
     _fire(resolver, sensors, areas, "s.door", True, now)
 
-    assert areas["hall"].last_motion == now
-    assert areas["room"].last_motion == now
+    assert areas["hall"].last_motion == 0
+    assert areas["room"].last_motion == 0
+    assert areas["hall"].last_contact == now
+    assert areas["room"].last_contact == now
+    assert areas["hall"].last_activity == now
+    assert areas["room"].last_activity == now
+    assert areas["hall"].occupancy == 0
+    assert areas["room"].occupancy == 0
 
 
 # ============================================================

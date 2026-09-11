@@ -1,4 +1,15 @@
-"""Configuration for integration tests."""
+"""Configuration for integration tests.
+
+Two levels of test share this directory:
+
+- Model level. ``SensorEventHelper`` drives the resolver and the coordinator
+  directly, so a long scenario costs one virtual clock and no event loop
+  scheduling. Use it for recorded walks and for scenarios that span hours.
+- Home Assistant level. ``test_home_assistant_level.py`` sets up the
+  integration with ``async_setup_component``, feeds real state-change events
+  and advances the integration's own periodic tick. Use it for anything that
+  depends on ingestion, scheduling, entities, services, or storage.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +30,9 @@ class SensorEventHelper:
     with the coordinator's periodic ``check_timeouts`` (which calls
     ``time.time()``).  Explicit ``timestamp`` values are treated as offsets
     from the base.
+
+    Occupancy deadlines only retire on the periodic tick, so a scenario that
+    waits for a hold or a retention ceiling has to call :meth:`tick`.
     """
 
     def __init__(self, coordinator: OccupancyCoordinator):
@@ -86,6 +100,28 @@ class SensorEventHelper:
     def advance_time(self, delta: float) -> None:
         """Advance the simulated time."""
         self.current_time += delta
+
+    def tick(self, delta: float | None = None) -> None:
+        """Advance time, then run the coordinator's periodic tick.
+
+        This is the production path that retires holds and retention
+        ceilings: vacancy has to happen with no further sensor events.
+        """
+        if delta is not None:
+            self.current_time += delta
+        self.coordinator.check_timeouts(timestamp=self.current_time)
+
+    def room(self, area_id: str):
+        """Return the engine's decision state for one room."""
+        return self.coordinator.occupancy_resolver.engine.rooms[area_id]
+
+    def occupied(self, *area_ids: str) -> set[str]:
+        """Return which of the given areas currently read as occupied."""
+        return {
+            area_id
+            for area_id in area_ids
+            if self.coordinator.get_occupancy(area_id) > 0
+        }
 
 
 @pytest.fixture(autouse=True)

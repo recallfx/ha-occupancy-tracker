@@ -782,12 +782,17 @@ def test_late_unexplained_activation_is_accepted_with_warning_semantics():
 
 
 # ==================================================================
-# 13. Departure evidence cannot clear a possibly occupied room
+# 13. A spilled entry is released at its hold deadline
 # ==================================================================
 
 
-def test_retained_room_survives_departure_grace():
-    """A departure trail cannot prove that a second occupant did not remain."""
+def test_spilled_entry_is_released_at_its_hold_deadline():
+    """An entry that starts inside the spill window never earns retention.
+
+    bedroom_2 fires 2 s after corridor_1, while corridor_1 is still ON, which
+    is the measured shape of detector spill rather than a person walking in.
+    Such a room holds for 90 s and then goes vacant.
+    """
     now = time.time()
     config = _full_house_config()
     resolver = MapOccupancyResolver(config)
@@ -799,23 +804,23 @@ def test_retained_room_survives_departure_grace():
     _fire(resolver, sensors, areas, "s.bedroom_2", True, now + 4)
     assert areas["bedroom_2"].occupancy == 1
 
-    # Person walks back — corridor_1 fires, bedroom_2 sensor goes OFF
+    assert resolver.engine.rooms["bedroom_2"].confirmed is False
+
+    # Person walks back — corridor_1 stays ON, bedroom_2 sensor goes OFF
     _fire(resolver, sensors, areas, "s.bedroom_2", False, now + 9)
     _fire(resolver, sensors, areas, "s.corridor_1", True, now + 10)
     _fire(resolver, sensors, areas, "s.study", True, now + 12)
-    # bedroom_2 should be retained (person might still be there)
-    # but study is now the main occupied area
 
-    # Before the grace expires, uncertainty is preserved.
+    # Until the deadline the room stays occupied.
     _fire(resolver, sensors, areas, "s.study", False, now + 72)
     _fire(resolver, sensors, areas, "s.study", True, now + 75)
     assert areas["bedroom_2"].occupancy == 1
 
-    # Bedroom motion followed by corridor motion could represent one person
-    # leaving while another remains, even after the old grace period.
+    # The hold expires 90 s after the room's own last OFF.
     _fire(resolver, sensors, areas, "s.study", False, now + 132)
     _fire(resolver, sensors, areas, "s.study", True, now + 135)
-    assert areas["bedroom_2"].occupancy == 1
+    assert areas["bedroom_2"].occupancy == 0
+    assert resolver.engine.rooms["bedroom_2"].reason == "unconfirmed_entry"
     assert areas["study"].occupancy == 1
 
 
@@ -936,8 +941,11 @@ def test_sensor_on_blocks_displacement():
 
 
 def test_sleeping_person_not_cleared():
-    """Person in bedroom with no motion for 2+ min is NOT cleared if no
-    adjacent room has more recent motion (no evidence of leaving)."""
+    """A quiet room with no departure trail is retained, not cleared.
+
+    corridor_2 fires more than the spill window before bedroom_1, so the
+    entry counts as a person and the room can be retained.
+    """
     now = time.time()
     config = _full_house_config()
     resolver = MapOccupancyResolver(config)
@@ -946,7 +954,7 @@ def test_sleeping_person_not_cleared():
     # Person enters bedroom_1 via corridor
     _fire(resolver, sensors, areas, "s.entrance", True, now)
     _fire(resolver, sensors, areas, "s.corridor_1", True, now + 2)
-    _fire(resolver, sensors, areas, "s.corridor_2", True, now + 4)
+    _fire(resolver, sensors, areas, "s.corridor_2", True, now + 3)
     _fire(resolver, sensors, areas, "s.bedroom_1", True, now + 6)
     assert areas["bedroom_1"].occupancy == 1
 
@@ -955,13 +963,14 @@ def test_sleeping_person_not_cleared():
     _fire(resolver, sensors, areas, "s.corridor_1", False, now + 7)
     _fire(resolver, sensors, areas, "s.corridor_2", False, now + 9)
     _fire(resolver, sensors, areas, "s.bedroom_1", False, now + 11)
-    assert areas["bedroom_1"].occupancy == 1  # Retained
+    assert areas["bedroom_1"].occupancy == 1  # Held until the deadline
 
     # 3 minutes pass. Another person is active in study (house NOT quiet).
-    # But corridor_2 (bedroom_1's neighbor) has NO new motion.
+    # But corridor_2 (bedroom_1's exit) has NO new motion, so no trail exists.
     t = now + 200
     _fire(resolver, sensors, areas, "s.study", True, t)
     assert areas["bedroom_1"].occupancy == 1, "Sleeping person cleared!"
+    assert resolver.engine.rooms["bedroom_1"].reason == "no_exit_trail"
 
     _fire(resolver, sensors, areas, "s.study", False, t + 5)
     _fire(resolver, sensors, areas, "s.study", True, t + 10)

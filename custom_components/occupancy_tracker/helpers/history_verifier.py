@@ -117,9 +117,12 @@ class HistoryVerifier:
             area_id: (
                 area.occupancy,
                 area.last_motion,
+                area.last_contact,
+                area.last_contact_open,
                 area.last_off,
                 area.stale_since,
                 area.cleared_by,
+                area.state_known,
                 area.last_occupied_at,
                 list(area.activity_history),
             )
@@ -131,6 +134,7 @@ class HistoryVerifier:
                 sensor.last_changed,
                 sensor.activated_at,
                 sensor.last_update_time,
+                sensor.last_source_timestamp,
                 list(sensor.history),
                 sensor.is_available,
                 sensor.is_reliable,
@@ -138,8 +142,7 @@ class HistoryVerifier:
             )
             for sensor_id, sensor in sensors.items()
         }
-        original_latched = set(resolver.indoor_latched)
-        original_first_activation = resolver._first_activation_time
+        original_resolver_state = resolver.capture_state()
 
         try:
             resolver.recalculate_from_history(
@@ -157,9 +160,12 @@ class HistoryVerifier:
                 (
                     area.occupancy,
                     area.last_motion,
+                    area.last_contact,
+                    area.last_contact_open,
                     area.last_off,
                     area.stale_since,
                     area.cleared_by,
+                    area.state_known,
                     area.last_occupied_at,
                     area.activity_history,
                 ) = state
@@ -173,15 +179,14 @@ class HistoryVerifier:
                     sensor.last_changed,
                     sensor.activated_at,
                     sensor.last_update_time,
+                    sensor.last_source_timestamp,
                     sensor.history,
                     sensor.is_available,
                     sensor.is_reliable,
                     sensor.is_stuck,
                 ) = state
 
-            resolver.indoor_latched.clear()
-            resolver.indoor_latched.update(original_latched)
-            resolver._first_activation_time = original_first_activation
+            resolver.restore_state(original_resolver_state)
 
     def verify_all_snapshots(
         self,
@@ -279,6 +284,35 @@ class HistoryVerifier:
                     )
                 )
 
+            if "last_contact" in recorded_data:
+                recorded_contact = recorded_data["last_contact"]
+                if abs(recorded_contact - replayed_area.last_contact) > self.tolerance:
+                    self.differences.append(
+                        StateDifference(
+                            snapshot_index=index,
+                            timestamp=snapshot.timestamp,
+                            description="Last contact timestamp mismatch",
+                            area_id=area_id,
+                            recorded_value=recorded_contact,
+                            replayed_value=replayed_area.last_contact,
+                        )
+                    )
+
+            if (
+                "state_known" in recorded_data
+                and recorded_data["state_known"] != replayed_area.state_known
+            ):
+                self.differences.append(
+                    StateDifference(
+                        snapshot_index=index,
+                        timestamp=snapshot.timestamp,
+                        description="Occupancy knowledge mismatch",
+                        area_id=area_id,
+                        recorded_value=recorded_data["state_known"],
+                        replayed_value=replayed_area.state_known,
+                    )
+                )
+
         # Compare sensors
         for sensor_id, recorded_data in snapshot.sensors.items():
             if sensor_id not in replayed_sensors:
@@ -321,6 +355,23 @@ class HistoryVerifier:
                         replayed_value=replayed_sensor.last_changed,
                     )
                 )
+
+            if "last_source_timestamp" in recorded_data:
+                recorded_source = recorded_data["last_source_timestamp"]
+                if (
+                    abs(recorded_source - replayed_sensor.last_source_timestamp)
+                    > self.tolerance
+                ):
+                    self.differences.append(
+                        StateDifference(
+                            snapshot_index=index,
+                            timestamp=snapshot.timestamp,
+                            description="Last source timestamp mismatch",
+                            sensor_id=sensor_id,
+                            recorded_value=recorded_source,
+                            replayed_value=replayed_sensor.last_source_timestamp,
+                        )
+                    )
 
             recorded_available = recorded_data.get("available", True)
             if recorded_available != replayed_sensor.is_available:

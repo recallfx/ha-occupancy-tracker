@@ -60,15 +60,18 @@ def test_record_clear_event_is_replayable():
     assert snapshot.description == "clear:living_room"
 
 
-def test_record_restore_event_is_replayable():
-    """Persistent occupancy restoration must be represented in event history."""
+def test_record_occupancy_restore_is_replayable():
+    """Restored rooms come from storage, so history has to carry them itself."""
     base_time, areas, sensors = _build_state_fixture()
     recorder = MapStateRecorder()
+    rooms = {"living_room": {"state": "retained", "deadline": base_time + 3600}}
 
-    snapshot = recorder.record_restore_event(base_time, ["living_room"], areas, sensors)
+    snapshot = recorder.record_occupancy_restore(base_time, rooms, areas, sensors)
 
     assert snapshot.event_type == "restore"
-    assert snapshot.description == "restore:living_room"
+    assert snapshot.description == "restore"
+    assert snapshot.rooms == rooms
+    assert [s.event_type for s in recorder.get_history()] == ["restore"]
 
 
 def test_tick_snapshots_respect_interval():

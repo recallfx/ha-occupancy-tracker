@@ -1,19 +1,26 @@
 # Occupancy Tracker [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=for-the-badge)](https://github.com/hacs/integration)
 
-A conservative Home Assistant integration for room occupancy tracking with unreliable motion sensors.
+A Home Assistant integration for room occupancy tracking with unreliable motion
+sensors. A room is released only by evidence of leaving, or by a policy ceiling
+that bounds the doubt.
+
+[BEHAVIOR.md](BEHAVIOR.md) is the binding specification of how the integration
+behaves. Read it before changing anything.
 
 ## Features
 
-- **Pessimistic Indoor Occupancy**: Positive evidence is retained through sleep, sensor OFF gaps, and ambiguous movement
+- **Exit-Gated Occupancy**: When a room's sensors fall silent it is held, then released if an exit or its own door contact fired as the person could have left, otherwise retained until its own motion returns or the profile's ceiling expires
 - **Multi-Area Support**: Every configured area of an active motion/person sensor is marked occupied
-- **Freshness Score**: Time-since-motion scoring for diagnostics, never for indoor clearing
-- **Short-Lived Activity**: A separate two-minute signal for recent room activity
-- **Multiple Occupants**: Movement by one person cannot clear a room where another may remain
+- **Room Profiles**: Corridors clear in 30 seconds; ordinary rooms retain up to 2 hours, living areas 4 hours, bedrooms 12 hours
+- **Short-Lived Activity**: A separate room-aware signal for recent motion or contact activity
+- **Multiple Occupants**: Neighbor motion alone never clears a room
 - **Live Outdoor State**: Outdoor occupancy follows current trusted sensor evidence
 - **Flexible Sensors**: Motion, magnetic (door/window), and camera detection
+- **Unavailable Is Not Vacant**: A room whose motion inputs all go unavailable publishes `unavailable`, not `off`
 - **Anomaly Detection**: Alerts for stuck sensors and unusual patterns
-- **Explicit Cleanup**: Clear all stale latches with a button or one room with a service
-- **Restart Persistence**: Quiet occupied rooms survive Home Assistant restarts
+- **Explicit Cleanup**: Clear every held room with a button or one room with a service
+- **Restart Persistence**: Held rooms survive Home Assistant restarts without being granted a fresh hold
+- **Structured Audit Trail**: Every accepted or ignored sensor decision, clear, restore, trust change, and warning lifecycle is recorded as JSONL
 
 ## Quick Start
 
@@ -24,11 +31,18 @@ occupancy_tracker:
   areas:
     living_room:
       name: "Living Room"
+      profile: living
+    hallway:
+      name: "Hallway"
+      profile: transition
     kitchen:
       name: "Kitchen"
+    bedroom:
+      name: "Bedroom"
+      profile: sleeping
     front_door:
       name: "Front Door"
-      exit_capable: true  # People can leave the system from here
+      exit_capable: true  # Diagnostics only; see BEHAVIOR.md section 4
   
   adjacency:
     living_room: [kitchen, front_door]
@@ -74,11 +88,26 @@ Define all rooms/spaces you want to track:
 areas:
   area_id:
     name: "Display Name"
-    exit_capable: false  # Optional: set true for entry/exit points
+    exit_capable: false  # Diagnostics only; see BEHAVIOR.md section 4
+    profile: living      # Optional: transition, default, living, or sleeping
 ```
 
-Indoor areas remain conservative even if they are marked `exit_capable`.
-Outdoor areas are not latched and return vacant when trusted live evidence ends.
+`exit_capable` affects diagnostics only (see BEHAVIOR.md section 4). Set
+`indoors: false` for yards and porches; outdoor areas mirror their sensors and
+are never exits.
+
+The room profile carries the timing policy of the state machine, plus the
+activity, freshness, and warning tuning:
+
+| Profile | Intended space | Hold after own motion stops | Retention ceiling | Activity hold |
+| --- | --- | ---: | ---: | ---: |
+| `transition` | Corridor, hall, stairs | 30 seconds | never retains | 20 seconds |
+| `default` | Bathroom, utility, garage, entrance | 90 seconds | 2 hours | 2 minutes |
+| `living` | Kitchen, lounge, office | 90 seconds | 4 hours | 2 minutes |
+| `sleeping` | Bedroom | 90 seconds | 12 hours | 15 minutes |
+
+`default` is the profile when none is set. Existing `transition: true`
+configuration maps to the `transition` profile for compatibility.
 
 ### Adjacency Map
 
@@ -91,7 +120,11 @@ adjacency:
   hallway: [living_room, bedroom]
 ```
 
-The system automatically makes connections bidirectional.
+The system automatically makes connections bidirectional. Adjacency also
+defines each room's exits: the indoor neighbors through which somebody can
+leave. A neighbor whose only indoor connection is the room itself is a dead
+end, such as an ensuite or a walk-in wardrobe, so walking into it is not
+leaving.
 
 ### Sensors
 
@@ -118,22 +151,36 @@ sensors:
 
 For each configured area, the integration creates two binary sensors:
 
-- `binary_sensor.<area>_occupancy` is the durable safety signal. It answers
-  whether someone could still be present.
-- `binary_sensor.<area>_activity` is ON while a trusted configured sensor is ON
-  or for two minutes after the latest recorded activity. It may turn OFF while
-  someone is sitting still or sleeping and never clears occupancy.
+- `binary_sensor.<slugified area name>_occupancy` answers whether someone is in
+  the room. It is ON while the room is occupied, held, or retained.
+- `binary_sensor.<slugified area name>_activity` is ON while a trusted
+  configured motion sensor is ON or for the room profile's activity hold (the
+  `Activity hold` column above) after motion or a contact edge. It may turn OFF
+  while someone is sitting still or sleeping and never feeds the occupancy
+  decision.
 
-Occupancy attributes include the boolean-compatible count, `evidence_state`
-(`active`, `stale`, `inferred`, or `vacant`), active sensor IDs, freshness,
-last positive evidence, stale time, and explicit clear reason. `probability`
-remains as a compatibility alias for `freshness`.
+The object id comes from the area's `name:`, slugified by Home Assistant, and
+falls back to the area id when `name:` is absent. An area id of `guest_room`
+with `name: "Guest Toilet"` publishes
+`binary_sensor.guest_toilet_occupancy`.
+
+Occupancy attributes explain the decision: `state`
+(`vacant`, `occupied`, `pending`, `retained`, or `unknown`), `reason`,
+`deadline`, `confirmed`, `evidence_age`, `exits`, `room_profile`, active sensor
+IDs, freshness, last positive evidence, stale time, and explicit clear reason.
+`probability` remains as a compatibility alias for `freshness`.
+
+A room whose motion inputs have all been unavailable for 60 seconds publishes
+`unavailable` rather than a confident `off`. Door/window contacts are departure
+evidence; they never fabricate motion.
 
 System-wide entities:
 
 - `sensor.detected_anomalies` - Active anomaly count and details
 - `button.reset_anomalies` - Clear anomaly state
-- `button.clear_stale_occupancy` - Explicitly clear all stale indoor occupancy
+- `sensor.total_occupants`, `sensor.total_occupants_inside`, `sensor.total_occupants_outside` - Counts of occupied areas (a room whose occupancy entity is unavailable still counts)
+- `sensor.occupied_inside_areas`, `sensor.occupied_outside_areas` - Counts with the area list as an attribute (a room whose occupancy entity is unavailable still counts)
+- `button.clear_stale_occupancy` - Explicitly clear every held indoor room
 
 To clear only one known-stale room without affecting any other room:
 
@@ -143,46 +190,64 @@ data:
   area_id: living_room
 ```
 
-The service refuses to clear a room while one of its trusted configured
-sensors is currently ON.
+The service refuses to clear a room while one of its motion sensors is
+currently trusted ON (an open door or window contact does not block a clear).
 
 ## How It Works
 
-The system uses a conservative event-driven state machine:
+Each room runs an exit-gated state machine. The full rules, with diagrams and
+worked timelines, are in [BEHAVIOR.md](BEHAVIOR.md); the outline:
 
-1. **Motion detected (ON)** → Marks area occupied immediately. Checks adjacent rooms for a "plausible source" (occupancy or active motion) and flags anomalies if none found.
-2. **Motion cleared (OFF)** → Updates freshness but does not claim the indoor room is vacant.
-3. **Movement elsewhere** → Updates diagnostics without clearing previously possible indoor occupancy.
-4. **Freshness decay** → The score drops over time, but cannot clear indoor occupancy.
-5. **Activity timeout** → The separate activity entity turns OFF after two quiet minutes; occupancy is unchanged.
-6. **Explicit cleanup** → Clears all stale latches with the button or one stale room with the service; currently active sensors remain occupied.
-7. **Anomaly alerts** → Flags unexpected movement, stuck sensors, extended occupancy, and stale-looking state without changing occupancy.
+1. **Motion detected (ON)** → The room becomes occupied at once, canceling any hold. An activation that starts within 2 seconds of an exit neighbor's activation is detector spill: it does not confirm an entry, and a room already held ignores it.
+2. **Motion cleared (OFF)** → The room is held for the profile's hold time, not declared vacant.
+3. **At the hold deadline** → Vacant if an exit neighbor, or the room's own door contact, fired within 30 seconds of the room going quiet (a departure trail); vacant if the entry was never confirmed, or the profile never retains; otherwise retained.
+4. **Retained** → Released by the room's own motion, or by the profile's retention ceiling.
+5. **Movement elsewhere** → Never changes a room on its own.
+6. **Freshness decay and activity timeout** → Diagnostics and the activity entity only; occupancy is unchanged.
+7. **Explicit cleanup** → Clears held rooms with the button or one room with the service; rooms with currently active motion are refused.
+8. **Anomaly alerts** → Flag unexpected movement, stuck sensors, extended occupancy, and stale-looking state without changing occupancy. A sensor ON for 24 hours is the one exception: it stops being trusted.
 
-The indoor latch is stored in Home Assistant's versioned storage. It is restored before current sensor baselines, so an initial PIR OFF state cannot erase a quiet occupied room.
+The decision state is stored in Home Assistant's versioned storage and restored
+before current sensor baselines. A restart never grants a fresh hold.
 
-Do not use the durable occupancy entity as an automatic lights-off signal: by
-design it may remain ON after motion stops. Use the room's raw motion sensors
-or the activity entity for convenience automation; use occupancy for the
-safety question "could someone still be here?"
+The integration writes three rotating files in the Home Assistant configuration
+directory:
 
-For technical details, see [ARCHITECTURE.md](ARCHITECTURE.md).
+- `occupancy_tracker.log` contains concise operational changes and warnings at INFO level.
+- `occupancy_tracker_audit.jsonl` is the authoritative structured trail, including source and receipt timestamps, accepted or ignored decisions, restore/clear actions, sensor trust changes, and warning resolution.
+- `occupancy_tracker_raw.csv` remains as a sensor-only compatibility export for older replay tools.
+
+The in-memory history verifier is non-mutating. Its bounded history is useful for
+checking determinism, but is never treated as authority to erase persistent
+occupancy.
+
+Late events cannot rewind a newer state for the same sensor. Invalid,
+out-of-order, and duplicate events remain visible in the audit with an explicit
+decision instead of silently changing occupancy.
+
+Do not use the occupancy entity as an automatic lights-off signal: by design it
+may remain ON after motion stops. Use the room's raw motion sensors or the
+activity entity for convenience automation.
+
+For the behavior rules see [BEHAVIOR.md](BEHAVIOR.md); for the code layout see
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Troubleshooting
 
 **Lights not turning on?**
-- Check for "Unexpected Motion" warnings in `sensor.occupancy_tracker_warnings`
-- Verify the area is in your adjacency map
-- Ensure adjacent areas have sensors
+- Check that the room's motion sensor is available and trusted: the occupancy entity's `active_sensors` attribute lists the sensors currently providing live evidence
+- Check the `state` and `reason` attributes of `binary_sensor.<area>_occupancy`
+- See BEHAVIOR.md section 12 for the accepted error cases
 
 **Occupancy stuck?**
 - Look for stuck sensor warnings
-- Use the per-room service when only one latch is known to be stale
-- Use **Clear Stale Occupancy** when all conservative state is no longer useful
+- Check the entity's `state`, `reason`, and `deadline` attributes: a `retained` room is waiting for its own motion or its ceiling
+- Use the per-room service when one room is known to be wrong, and **Clear Stale Occupancy** to clear every held room. Needing either is a bug report, not a workaround
 
 **Erratic behavior?**
 - Review your adjacency map (are all connections defined?)
 - Check sensor entity IDs match your configuration
-- Enable debug logging: `logger: custom_components.occupancy_tracker: debug`
+- Inspect `occupancy_tracker_audit.jsonl` for the accepted or ignored decision
 
 ## Development
 
@@ -213,7 +278,8 @@ uv run pytest tests/integration/ -v
 uv run pytest --cov=custom_components.occupancy_tracker
 ```
 
-See [tests/integration/README.md](tests/integration/README.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for more details.
+See [BEHAVIOR.md](BEHAVIOR.md) for the rules the tests pin, and
+[ARCHITECTURE.md](ARCHITECTURE.md) for the code layout.
 
 ## Contributing
 
@@ -221,7 +287,7 @@ Contributions welcome! Please:
 1. Open an issue to discuss major changes
 2. Follow existing code style (ruff formatting)
 3. Add tests for new features
-4. Update documentation as needed
+4. Change [BEHAVIOR.md](BEHAVIOR.md) before changing behavior, and update the rest of the documentation as needed
 
 ## License
 

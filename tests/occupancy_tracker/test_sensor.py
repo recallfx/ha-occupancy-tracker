@@ -18,6 +18,7 @@ from custom_components.occupancy_tracker.binary_sensor import (
     async_setup_platform as async_setup_binary_sensor_platform,
 )
 from custom_components.occupancy_tracker.coordinator import OccupancyCoordinator
+from custom_components.occupancy_tracker.helpers.room_profiles import ROOM_PROFILES
 
 
 def _set_occupancy(area, count):
@@ -73,6 +74,16 @@ class TestAreaOccupancyBinarySensor:
 
         assert sensor.is_on is False
 
+    def test_unknown_indoor_state_is_unavailable(self, coordinator):
+        """Missing durable state is not presented as confident vacancy."""
+        sensor = AreaOccupancyBinarySensor(coordinator, "bedroom")
+
+        assert sensor.available is False
+
+        coordinator.areas["bedroom"].clear_occupancy(1_000.0, reason="manual_clear")
+        assert sensor.available is True
+        assert sensor.is_on is False
+
     def test_attributes_include_count(self, coordinator):
         """Test attributes include occupancy count."""
         _set_occupancy(coordinator.areas["living_room"], 1)
@@ -94,35 +105,44 @@ class TestAreaOccupancyBinarySensor:
         assert attrs["probability"] == 1.0
 
     def test_attributes_explain_occupancy_evidence(self, coordinator):
-        """Area attributes distinguish live evidence from a stale latch."""
-        area = coordinator.areas["living_room"]
-        sensor_state = coordinator.sensors["binary_sensor.living_room_motion"]
+        """Area attributes distinguish live motion from a room on a hold."""
         sensor = AreaOccupancyBinarySensor(coordinator, "living_room")
 
-        area.occupied = True
-        area.record_motion(1000.0)
-        sensor_state.current_state = True
-        assert sensor.extra_state_attributes["evidence_state"] == "active"
+        coordinator.process_sensor_event(
+            "binary_sensor.living_room_motion", True, 1000.0
+        )
+        assert sensor.extra_state_attributes["evidence_state"] == "occupied"
         assert sensor.extra_state_attributes["active_sensors"] == [
             "binary_sensor.living_room_motion"
         ]
 
-        sensor_state.current_state = False
-        area.stale_since = 1010.0
-        coordinator.occupancy_resolver.indoor_latched.add("living_room")
+        coordinator.process_sensor_event(
+            "binary_sensor.living_room_motion", False, 1010.0
+        )
         attrs = sensor.extra_state_attributes
-        assert attrs["evidence_state"] == "stale"
+        assert attrs["evidence_state"] == "pending"
+        assert attrs["active_sensors"] == []
         assert attrs["last_positive_evidence"] == 1000.0
         assert attrs["stale_since"] == 1010.0
 
-    def test_attributes_explain_inferred_and_vacant_states(self, coordinator):
-        """Non-latched occupancy remains visibly distinct from vacancy."""
-        sensor = AreaOccupancyBinarySensor(coordinator, "porch")
+    def test_attributes_name_the_engine_state_not_a_latch(self, coordinator):
+        """A room held without a departure trail stays distinct from vacancy."""
+        porch = AreaOccupancyBinarySensor(coordinator, "porch")
+        assert porch.extra_state_attributes["evidence_state"] == "vacant"
 
-        assert sensor.extra_state_attributes["evidence_state"] == "vacant"
+        living_room = AreaOccupancyBinarySensor(coordinator, "living_room")
+        coordinator.process_sensor_event(
+            "binary_sensor.living_room_motion", True, 1000.0
+        )
+        coordinator.process_sensor_event(
+            "binary_sensor.living_room_motion", False, 1010.0
+        )
+        coordinator.check_timeouts(1010.0 + ROOM_PROFILES["default"].hold_seconds)
 
-        coordinator.areas["porch"].occupied = True
-        assert sensor.extra_state_attributes["evidence_state"] == "inferred"
+        attrs = living_room.extra_state_attributes
+        assert attrs["evidence_state"] == "retained"
+        assert attrs["reason"] == "no_exit_trail"
+        assert attrs["confirmed"] is True
 
     def test_attributes_include_area_properties(self, coordinator):
         """Test attributes include indoors and exit_capable."""
@@ -150,11 +170,13 @@ class TestAreaOccupancyBinarySensor:
 class TestAreaActivityBinarySensor:
     """Test the short-lived, non-authoritative activity signal."""
 
-    def test_recent_activity_expires_without_clearing_safe_occupancy(self, coordinator):
-        area = coordinator.areas["living_room"]
-        area.record_motion(1000.0)
-        area.occupied = True
-        coordinator.occupancy_resolver.indoor_latched.add("living_room")
+    def test_recent_activity_expires_without_clearing_a_held_room(self, coordinator):
+        coordinator.process_sensor_event(
+            "binary_sensor.living_room_motion", True, 1000.0
+        )
+        coordinator.process_sensor_event(
+            "binary_sensor.living_room_motion", False, 1005.0
+        )
         sensor = AreaActivityBinarySensor(coordinator, "living_room")
 
         with pytest.MonkeyPatch.context() as monkeypatch:
@@ -189,6 +211,21 @@ class TestAreaActivityBinarySensor:
 
         assert sensor.is_on is False
         assert sensor.extra_state_attributes["activity_source"] == "none"
+
+    def test_recent_contact_is_activity_without_becoming_motion(self, coordinator):
+        area = coordinator.areas["living_room"]
+        area.record_contact(1_000.0, is_open=True)
+        sensor = AreaActivityBinarySensor(coordinator, "living_room")
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                "custom_components.occupancy_tracker.sensors.area_sensors.time.time",
+                lambda: 1_001.0,
+            )
+            assert sensor.is_on is True
+            assert sensor.extra_state_attributes["activity_source"] == "recent_contact"
+
+        assert area.last_motion == 0
 
     def test_identity_and_device_class(self, coordinator):
         sensor = AreaActivityBinarySensor(coordinator, "living_room")

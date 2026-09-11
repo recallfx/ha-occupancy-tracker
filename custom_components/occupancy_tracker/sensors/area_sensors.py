@@ -9,7 +9,6 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from ..coordinator import OccupancyCoordinator
-from ..helpers.constants import ACTIVITY_HOLD_SECONDS
 
 
 class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
@@ -33,6 +32,12 @@ class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
         return self.coordinator.get_occupancy(self._area) > 0
 
     @property
+    def available(self) -> bool:
+        """Unknown indoor state is not confident vacancy."""
+        area_state = self.coordinator.areas.get(self._area)
+        return super().available and bool(area_state and area_state.state_known)
+
+    @property
     def extra_state_attributes(self):
         """Return occupancy evidence and freshness attributes."""
         area_state = self.coordinator.areas.get(self._area)
@@ -44,7 +49,16 @@ class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
         last_motion = area_state.last_motion
         time_since = round(now - last_motion) if last_motion > 0 else None
 
+        room = self.coordinator.get_room_state(self._area)
+
         return {
+            "state": room.get("state"),
+            "state_since": room.get("state_since"),
+            "reason": room.get("reason"),
+            "deadline": room.get("deadline"),
+            "confirmed": room.get("confirmed"),
+            "evidence_age": room.get("evidence_age"),
+            "exits": room.get("exits"),
             "occupancy_count": area_state.occupancy,
             "evidence_state": self.coordinator.get_occupancy_evidence(self._area),
             "active_sensors": self.coordinator.get_active_sensor_ids(self._area),
@@ -52,11 +66,15 @@ class AreaOccupancyBinarySensor(CoordinatorEntity, BinarySensorEntity):
             "probability": round(freshness, 2),
             "last_motion": last_motion if last_motion > 0 else None,
             "last_positive_evidence": last_motion if last_motion > 0 else None,
+            "last_contact": area_state.last_contact or None,
+            "last_activity": area_state.last_activity or None,
             "stale_since": area_state.stale_since,
             "cleared_by": area_state.cleared_by,
             "time_since_motion_s": time_since,
             "is_indoors": area_state.is_indoors,
             "is_exit_capable": area_state.is_exit_capable,
+            "state_known": area_state.state_known,
+            "room_profile": area_state.profile_name,
         }
 
 
@@ -77,9 +95,11 @@ class AreaActivityBinarySensor(CoordinatorEntity, BinarySensorEntity):
             return "live"
 
         area = self.coordinator.areas.get(self._area)
-        if area and area.last_motion > 0:
-            age = now - area.last_motion
-            if age <= ACTIVITY_HOLD_SECONDS:
+        if area and area.last_activity > 0:
+            age = now - area.last_activity
+            if age <= area.profile.activity_hold_seconds:
+                if area.last_contact > area.last_motion:
+                    return "recent_contact"
                 return "recent"
         return "none"
 
@@ -96,13 +116,14 @@ class AreaActivityBinarySensor(CoordinatorEntity, BinarySensorEntity):
             return {}
 
         now = time.time()
-        last_motion = area.last_motion
-        age = max(0, round(now - last_motion)) if last_motion > 0 else None
+        last_activity = area.last_activity
+        age = max(0, round(now - last_activity)) if last_activity > 0 else None
         return {
             "activity_source": self._activity_source(now),
-            "hold_seconds": ACTIVITY_HOLD_SECONDS,
-            "last_activity": last_motion if last_motion > 0 else None,
+            "hold_seconds": area.profile.activity_hold_seconds,
+            "last_activity": last_activity if last_activity > 0 else None,
             "activity_age_s": age,
             "safe_occupancy": area.occupied,
             "occupancy_evidence": self.coordinator.get_occupancy_evidence(self._area),
+            "room_profile": area.profile_name,
         }

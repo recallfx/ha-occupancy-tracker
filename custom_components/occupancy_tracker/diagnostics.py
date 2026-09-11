@@ -3,6 +3,14 @@
 import time
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
+from .helpers.occupancy_engine import (
+    STATE_OCCUPIED,
+    STATE_PENDING,
+    STATE_RETAINED,
+    STATE_UNKNOWN,
+    STATE_VACANT,
+)
+
 if TYPE_CHECKING:
     from .coordinator import OccupancyCoordinator
 
@@ -25,9 +33,12 @@ class OccupancyDiagnostics:
             "id": area_id,
             "name": area.config.get("name", area_id),
             "occupancy": area.occupancy,
+            **self.coordinator.get_room_state(area_id),
             "evidence_state": self.coordinator.get_occupancy_evidence(area_id),
             "active_sensors": self.coordinator.get_active_sensor_ids(area_id),
             "last_motion": area.last_motion,
+            "last_contact": area.last_contact,
+            "last_activity": area.last_activity,
             "last_positive_evidence": area.last_positive_evidence,
             "stale_since": area.stale_since,
             "cleared_by": area.cleared_by,
@@ -36,6 +47,8 @@ class OccupancyDiagnostics:
             else None,
             "indoors": area.is_indoors,
             "exit_capable": area.is_exit_capable,
+            "state_known": area.state_known,
+            "room_profile": area.profile_name,
             "adjacent_areas": self.coordinator.config.get("adjacency", {}).get(
                 area_id, []
             ),
@@ -55,7 +68,13 @@ class OccupancyDiagnostics:
         }
         evidence_counts = {
             state: sum(value == state for value in area_evidence.values())
-            for state in ("active", "stale", "inferred", "vacant")
+            for state in (
+                STATE_OCCUPIED,
+                STATE_PENDING,
+                STATE_RETAINED,
+                STATE_VACANT,
+                STATE_UNKNOWN,
+            )
         }
 
         return {

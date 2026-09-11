@@ -1,1092 +1,491 @@
-"""Production replay tests — exact sensor events from 2026-03-16 production logs.
+"""Production replay tests: recorded sensor events on the real house layout.
 
-Replays real sensor event sequences through the conservative resolver using
-the FULL 21-area house config. Asserts boolean occupancy and no false vacancy
-at key checkpoints.
+The event sequences come from the 2026-03-16 production logs and from the
+observed detector behavior described in the occupancy data analysis: KNX
+detectors report OFF about 5 s after the last movement, the kitchen and dining
+detectors overlap, and corridor_2 spills into the bedroom doorways within
+half a second.
 
-Log source: ssh 192.168.1.10 /config/occupancy_tracker.log
-Config source: the repository's config.yaml, kept byte-identical to the live file.
+The house layout is read straight from the shipped ``config.yaml``, so the
+replay and production cannot drift apart.
 
-IMPORTANT BEHAVIORAL NOTE:
-Corridor spill (corridor_1 fires study, bedroom_2, corridor_2 within 0.06-1.4s)
-can create additional claims via "new entry with evidence" when the spill target
-has a recently-active neighbor. These are transient claims that represent the
-resolver's conservative approach — better to over-count briefly than lose track
-of a real person. The critical invariant is: **the open-plan group never inflates
-beyond 1** and the person's final position is correct.
+What the replay asserts is the exit-gated contract:
+
+- A room that was left releases at its hold deadline, because an exit fired in
+  the trail window right after its own activity stopped.
+- A room with no departure trail keeps its occupancy, bounded by the retention
+  ceiling of its profile.
+- Corridors are transition rooms and never retain.
+- An activation that starts within the spill window of a neighbour's is not
+  evidence anybody entered, and is never retained.
+- Where the recorded events genuinely cannot say which room of an overlapping
+  pair holds the person, the assertion is on the group, not on the room.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 import time
 
+import pytest
 import yaml
 
-from custom_components.occupancy_tracker.helpers.map_occupancy_resolver import (
-    MapOccupancyResolver,
-)
 from custom_components.occupancy_tracker.helpers.anomaly_detector import (
     AnomalyDetector,
 )
 from custom_components.occupancy_tracker.helpers.area_state import AreaState
 from custom_components.occupancy_tracker.helpers.constants import MOTION_SENSOR_TYPES
-from custom_components.occupancy_tracker.helpers.sensor_state import SensorState
+from custom_components.occupancy_tracker.helpers.map_occupancy_resolver import (
+    MapOccupancyResolver,
+)
 from custom_components.occupancy_tracker.helpers.map_state_recorder import MapSnapshot
+from custom_components.occupancy_tracker.helpers.occupancy_engine import (
+    STATE_OCCUPIED,
+    STATE_PENDING,
+    STATE_RETAINED,
+    STATE_VACANT,
+)
+from custom_components.occupancy_tracker.helpers.room_profiles import ROOM_PROFILES
+from custom_components.occupancy_tracker.helpers.sensor_state import SensorState
 
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.yaml"
+PRODUCTION_CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+HOLD = ROOM_PROFILES["default"].hold_seconds
+TRANSITION_HOLD = ROOM_PROFILES["transition"].hold_seconds
+LIVING_CEILING = ROOM_PROFILES["living"].retention_ceiling_seconds
+SLEEPING_CEILING = ROOM_PROFILES["sleeping"].retention_ceiling_seconds
 
+OPEN_PLAN = ("kitchen", "dining_room", "living")
 
-def _sensor_event(sensor_id: str, on: bool, ts: float) -> MapSnapshot:
-    return MapSnapshot(
-        timestamp=ts,
-        event_type="sensor",
-        description=f"sensor:{sensor_id}:{'on' if on else 'off'}",
-        areas={},
-        sensors={},
-    )
-
-
-def _fire(resolver, sensors, areas, sensor_id, on, ts, detector=None):
-    """Update sensor state then process snapshot (mirrors coordinator behavior)."""
-    previously_occupied_indoor = {
-        area_id for area_id, area in areas.items() if area.is_indoors and area.occupied
+#: Every way the engine is allowed to take occupancy away from a room.
+RELEASE_REASONS = frozenset(
+    {
+        "departure_trail",
+        "unconfirmed_entry",
+        "transition_room",
+        "retention_ceiling",
+        "manual_clear",
+        "manual_service",
+        "manual_button",
     }
-    sensor = sensors.get(sensor_id)
-    if sensor:
-        sensor.update_state(on, ts)
-    resolver.process_snapshot(
-        _sensor_event(sensor_id, on, ts), areas, sensors, detector
-    )
-    active_areas = {
-        area_id
-        for sensor in sensors.values()
-        if sensor.is_trusted_active and sensor.config.get("type") in MOTION_SENSOR_TYPES
-        for area_id in sensor.area_ids
-    }
-    assert active_areas <= {
-        area_id for area_id, area in areas.items() if area.occupied
-    }, "Trusted active sensor produced a false vacancy"
-    assert resolver.indoor_latched <= {
-        area_id for area_id, area in areas.items() if area.occupied
-    }, "Indoor latch produced a false vacancy"
-    assert all(
-        areas[area_id].occupied or areas[area_id].cleared_by
-        for area_id in previously_occupied_indoor
-    ), "Indoor occupancy cleared without an explicit reason"
+)
 
 
-def _total_occupancy(areas):
-    return sum(a.occupancy for a in areas.values())
+class Replay:
+    """Feed recorded sensor events into the resolver on a virtual clock.
 
+    Every timestamp is an offset in seconds from the start of the replay, so
+    the recorded gaps stay readable. Sensors start ten minutes in the past so
+    that no initial state looks like recent evidence.
+    """
 
-def _occupied_areas(areas):
-    """Return dict of area_id -> occupancy for areas with claims."""
-    return {aid: a.occupancy for aid, a in areas.items() if a.occupancy > 0}
+    def __init__(self) -> None:
+        self.start = time.time()
+        self.resolver = MapOccupancyResolver(PRODUCTION_CONFIG)
+        self.detector = AnomalyDetector(PRODUCTION_CONFIG)
+        self.areas = {
+            area_id: AreaState(area_id, area_config)
+            for area_id, area_config in PRODUCTION_CONFIG["areas"].items()
+        }
+        self.sensors = {
+            sensor_id: SensorState(sensor_id, sensor_config, self.start - 600)
+            for sensor_id, sensor_config in PRODUCTION_CONFIG["sensors"].items()
+        }
 
+    # -- driving --------------------------------------------------------
 
-def _open_plan_occupancy(areas):
-    """Sum occupancy across kitchen + dining_room + living."""
-    return (
-        areas["kitchen"].occupancy
-        + areas["dining_room"].occupancy
-        + areas["living"].occupancy
-    )
-
-
-def _assert_no_area_above(areas, max_occ, context=""):
-    """Assert no single area exceeds max_occ occupants."""
-    for aid, a in areas.items():
-        assert a.occupancy <= max_occ, (
-            f"Area {aid} has occupancy={a.occupancy} (max {max_occ}) {context}"
+    def fire(self, sensor_id: str, on: bool, at: float) -> None:
+        """Replay one sensor edge, the way the coordinator would apply it."""
+        timestamp = self.start + at
+        before = self._occupied_indoor()
+        sensor = self.sensors[sensor_id]
+        sensor.update_state(on, timestamp)
+        self.resolver.process_snapshot(
+            MapSnapshot(
+                timestamp=timestamp,
+                event_type="sensor",
+                description=f"sensor:{sensor_id}:{'on' if on else 'off'}",
+                areas={},
+                sensors={},
+            ),
+            self.areas,
+            self.sensors,
+            self.detector,
         )
+        self._check_invariants(before)
+
+    def tick(self, at: float) -> None:
+        """Advance the clock with no sensor events, as the 10 s tick does."""
+        before = self._occupied_indoor()
+        self.resolver.refresh_occupancy(self.start + at, self.areas, self.sensors)
+        self._check_invariants(before)
+
+    # -- reading --------------------------------------------------------
+
+    def room(self, area_id: str):
+        """Return the engine's decision state for one room."""
+        return self.resolver.engine.rooms[area_id]
+
+    def occupied(self) -> set[str]:
+        """Return every indoor area that currently reads as occupied."""
+        return self._occupied_indoor()
+
+    def open_plan_occupancy(self) -> int:
+        """Return how many of the three overlapping rooms read as occupied."""
+        return sum(self.areas[area_id].occupancy for area_id in OPEN_PLAN)
+
+    # -- invariants -----------------------------------------------------
+
+    def _occupied_indoor(self) -> set[str]:
+        return {
+            area_id
+            for area_id, area in self.areas.items()
+            if area.is_indoors and area.occupied
+        }
+
+    def _check_invariants(self, before: set[str]) -> None:
+        """Assert what must hold after every single event."""
+        for area_id, area in self.areas.items():
+            assert area.occupancy in (0, 1), (
+                f"{area_id} reports occupancy {area.occupancy}; rooms are boolean"
+            )
+
+        active = {
+            area_id
+            for sensor in self.sensors.values()
+            if sensor.is_trusted_active
+            and sensor.config.get("type") in MOTION_SENSOR_TYPES
+            for area_id in sensor.area_ids
+        }
+        assert active <= self._occupied_indoor() | {
+            area_id for area_id in active if not self.areas[area_id].is_indoors
+        }, "a trusted active motion sensor produced a false vacancy"
+
+        for area_id in before - self._occupied_indoor():
+            assert self.room(area_id).reason in RELEASE_REASONS, (
+                f"{area_id} was released for reason {self.room(area_id).reason!r}, "
+                "which is not a decision the state machine is allowed to make"
+            )
+
+
+# ----------------------------------------------------------------------
+# The shipped layout
+# ----------------------------------------------------------------------
 
 
 def test_bedroom2_corridor2_overlap_is_modelled():
-    """Bedroom 2 can plausibly spill with the rear corridor sensor."""
+    """Bedroom 2 can plausibly spill with the rear corridor detector."""
     assert "bedroom_2" in PRODUCTION_CONFIG["adjacency"]["corridor_2"]
     assert "corridor_2" in PRODUCTION_CONFIG["adjacency"]["bedroom_2"]
 
 
-# ------------------------------------------------------------------
-# Full production config (21 areas, all sensors, all adjacency)
-# ------------------------------------------------------------------
-
-PRODUCTION_CONFIG = {
-    "areas": {
-        # Indoor
-        "entrance": {"name": "Entrance", "indoors": True},
-        "garage": {"name": "Garage", "indoors": True},
-        "guest_room": {"name": "Guest Toilet", "indoors": True},
-        "workshop": {"name": "Workshop", "indoors": True},
-        "corridor_1": {
-            "name": "Corridor 1 (Front)",
-            "indoors": True,
-            "transition": True,
-        },
-        "corridor_2": {
-            "name": "Corridor 2 (Back)",
-            "indoors": True,
-            "transition": True,
-        },
-        "kitchen": {"name": "Kitchen", "indoors": True},
-        "dining_room": {"name": "Dining Room", "indoors": True},
-        "living": {"name": "Living Room", "indoors": True},
-        "study": {"name": "Study", "indoors": True},
-        "bedroom_2": {"name": "Bedroom 2", "indoors": True},
-        "bathroom": {"name": "Bathroom", "indoors": True},
-        "bedroom_1": {"name": "Bedroom 1", "indoors": True},
-        "utility_room": {"name": "Utility Room", "indoors": True},
-        "main_bedroom": {"name": "Main Bedroom", "indoors": True},
-        "main_bathroom": {"name": "Main Bathroom", "indoors": True},
-        "wardrobe": {"name": "Wardrobe", "indoors": True},
-        # Outdoor
-        "frontyard": {"name": "Front Yard", "indoors": False, "exit_capable": True},
-        "backyard": {"name": "Back Yard", "indoors": False, "exit_capable": True},
-        "left_side": {"name": "Left Side", "indoors": False, "exit_capable": True},
-        "right_side": {"name": "Right Side", "indoors": False, "exit_capable": True},
-    },
-    "adjacency": {
-        "frontyard": ["entrance", "garage", "backyard", "left_side", "right_side"],
-        "backyard": [
-            "entrance",
-            "kitchen",
-            "main_bedroom",
-            "frontyard",
-            "left_side",
-            "right_side",
-        ],
-        "left_side": ["frontyard", "backyard", "bedroom_1", "utility_room"],
-        "right_side": ["frontyard", "backyard", "workshop"],
-        "entrance": [
-            "frontyard",
-            "garage",
-            "guest_room",
-            "corridor_1",
-            "backyard",
-            "kitchen",
-            "workshop",
-        ],
-        "garage": ["entrance", "frontyard", "workshop"],
-        "guest_room": ["entrance"],
-        "workshop": ["entrance", "garage", "right_side"],
-        "corridor_1": ["entrance", "corridor_2", "study", "bedroom_2", "bathroom"],
-        "corridor_2": [
-            "corridor_1",
-            "bedroom_1",
-            "bedroom_2",
-            "main_bedroom",
-            "utility_room",
-        ],
-        "kitchen": ["entrance", "dining_room", "living", "backyard"],
-        "dining_room": ["kitchen", "living"],
-        "living": ["kitchen", "dining_room"],
-        "study": ["corridor_1"],
-        "bedroom_2": ["corridor_1", "corridor_2"],
-        "bathroom": ["corridor_1"],
-        "bedroom_1": ["corridor_2", "left_side"],
-        "utility_room": ["corridor_2", "left_side"],
-        "main_bedroom": ["corridor_2", "main_bathroom", "wardrobe", "backyard"],
-        "main_bathroom": ["main_bedroom"],
-        "wardrobe": ["main_bedroom"],
-    },
-    "open_plan_groups": {
-        "open_plan": {"areas": ["kitchen", "dining_room", "living"]},
-    },
-    "sensors": {
-        # KNX motion sensors
-        "binary_sensor.entrance_motion": {"area": "entrance", "type": "motion"},
-        "binary_sensor.garage_motion": {"area": "garage", "type": "motion"},
-        "binary_sensor.garage_pir": {"area": "garage", "type": "motion"},
-        "binary_sensor.guest_room_motion": {"area": "guest_room", "type": "motion"},
-        "binary_sensor.workshop_motion": {"area": "workshop", "type": "motion"},
-        "binary_sensor.workshop_pir": {"area": "workshop", "type": "motion"},
-        "binary_sensor.corridor_1_motion": {"area": "corridor_1", "type": "motion"},
-        "binary_sensor.corridor_2_motion": {"area": "corridor_2", "type": "motion"},
-        "binary_sensor.kitchen_motion": {"area": "kitchen", "type": "motion"},
-        "binary_sensor.dining_room_motion": {"area": "dining_room", "type": "motion"},
-        "binary_sensor.living_room_motion": {"area": "living", "type": "motion"},
-        "binary_sensor.study_motion": {"area": "study", "type": "motion"},
-        "binary_sensor.bedroom_2_motion": {"area": "bedroom_2", "type": "motion"},
-        "binary_sensor.bathroom_motion": {"area": "bathroom", "type": "motion"},
-        "binary_sensor.bedroom_1_motion": {"area": "bedroom_1", "type": "motion"},
-        "binary_sensor.utility_room_motion": {"area": "utility_room", "type": "motion"},
-        "binary_sensor.main_bedroom_motion": {"area": "main_bedroom", "type": "motion"},
-        "binary_sensor.main_bathroom_motion": {
-            "area": "main_bathroom",
-            "type": "motion",
-        },
-        "binary_sensor.wardrobe_motion": {"area": "wardrobe", "type": "motion"},
-        # Magnetic sensors
-        "binary_sensor.entrance_magnet": {
-            "area": ["entrance", "frontyard"],
-            "type": "magnetic",
-        },
-        "binary_sensor.corridor_magnet": {
-            "area": ["entrance", "backyard"],
-            "type": "magnetic",
-        },
-        "binary_sensor.sliding_door_magnet": {
-            "area": ["kitchen", "backyard"],
-            "type": "magnetic",
-        },
-        "binary_sensor.main_bedroom_magnet": {
-            "area": ["main_bedroom", "backyard"],
-            "type": "magnetic",
-        },
-        "binary_sensor.bathroom_magnet": {
-            "area": ["bathroom", "backyard"],
-            "type": "magnetic",
-        },
-        "binary_sensor.bedroom_1_magnet": {
-            "area": ["bedroom_1", "left_side"],
-            "type": "magnetic",
-        },
-        "binary_sensor.utility_magnet": {
-            "area": ["utility_room", "left_side"],
-            "type": "magnetic",
-        },
-        "binary_sensor.workshop_magnet": {
-            "area": ["workshop", "right_side"],
-            "type": "magnetic",
-        },
-        "binary_sensor.bedroom_2_magnet": {
-            "area": ["bedroom_2", "frontyard"],
-            "type": "magnetic",
-        },
-        "binary_sensor.study_magnet": {
-            "area": ["study", "frontyard"],
-            "type": "magnetic",
-        },
-        # Camera sensors
-        "binary_sensor.front_left_motion": {
-            "area": "frontyard",
-            "type": "camera_motion",
-        },
-        "binary_sensor.front_left_person_detected": {
-            "area": "frontyard",
-            "type": "camera_person",
-        },
-        "binary_sensor.front_motion": {"area": "frontyard", "type": "camera_motion"},
-        "binary_sensor.front_person_detected": {
-            "area": "frontyard",
-            "type": "camera_person",
-        },
-        "binary_sensor.front_right_motion": {
-            "area": "frontyard",
-            "type": "camera_motion",
-        },
-        "binary_sensor.front_right_person_detected": {
-            "area": "frontyard",
-            "type": "camera_person",
-        },
-        "binary_sensor.doorbell_motion": {"area": "frontyard", "type": "camera_motion"},
-        "binary_sensor.doorbell_person_detected": {
-            "area": "frontyard",
-            "type": "camera_person",
-        },
-        "binary_sensor.back_left_motion": {"area": "backyard", "type": "camera_motion"},
-        "binary_sensor.back_left_person_detected": {
-            "area": "backyard",
-            "type": "camera_person",
-        },
-        "binary_sensor.back_right_motion": {
-            "area": "backyard",
-            "type": "camera_motion",
-        },
-        "binary_sensor.back_right_person_detected": {
-            "area": "backyard",
-            "type": "camera_person",
-        },
-        "binary_sensor.left_motion": {"area": "left_side", "type": "camera_motion"},
-        "binary_sensor.left_person_detected": {
-            "area": "left_side",
-            "type": "camera_person",
-        },
-        "binary_sensor.right_motion": {"area": "right_side", "type": "camera_motion"},
-        "binary_sensor.right_person_detected": {
-            "area": "right_side",
-            "type": "camera_person",
-        },
-    },
-}
+def test_the_shipped_layout_gives_the_state_machine_what_it_needs():
+    """The state machine reads its policy from the shipped configuration."""
+    areas = PRODUCTION_CONFIG["areas"]
+    assert areas["corridor_1"]["transition"] is True
+    assert areas["corridor_2"]["transition"] is True
+    assert areas["bedroom_1"]["profile"] == "sleeping"
+    assert areas["main_bedroom"]["profile"] == "sleeping"
+    for area_id in OPEN_PLAN + ("study",):
+        assert areas[area_id]["profile"] == "living"
 
 
-def test_checked_in_config_matches_production_replay():
-    """Keep the committed production config and replay fixture identical."""
-    config_path = Path(__file__).resolve().parents[2] / "config.yaml"
-    checked_in_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+def test_the_main_bedroom_suite_counts_as_still_inside():
+    """An ensuite and a wardrobe are dead ends, so they are not exits."""
+    replay = Replay()
+    assert replay.resolver.engine.exits_for("main_bedroom") == frozenset({"corridor_2"})
+    assert replay.resolver.engine.exits_for("bedroom_1") == frozenset({"corridor_2"})
+    assert replay.resolver.engine.exits_for("study") == frozenset({"corridor_1"})
 
-    assert checked_in_config == PRODUCTION_CONFIG
+
+# ----------------------------------------------------------------------
+# Recorded walks
+# ----------------------------------------------------------------------
 
 
-def _make_system():
-    """Create resolver, areas, sensors, and anomaly detector from production config.
+def _seed_person_in_study(replay: Replay) -> float:
+    """Walk somebody in through the entrance and sit them in the study.
 
-    Sensors are initialized with a timestamp far in the past so that
-    magnetic sensors' initial last_changed doesn't provide false evidence
-    for the has_magnetic_evidence check (OUTDOOR_INTRUSION_WINDOW = 300s).
+    The first study edge lands 1 s after corridor_1's, which is inside the
+    spill window, so it is unconfirmed. The person moving again once they are
+    in the room is what confirms it, exactly as the logs show.
+
+    Returns the offset at which the next sequence can start.
     """
-    now = time.time()
-    sensor_init_time = now - 600  # 10 minutes ago — well past any evidence window
-    resolver = MapOccupancyResolver(PRODUCTION_CONFIG)
-    detector = AnomalyDetector(PRODUCTION_CONFIG)
-    areas = {
-        aid: AreaState(aid, cfg) for aid, cfg in PRODUCTION_CONFIG["areas"].items()
-    }
-    sensors = {
-        sid: SensorState(sid, cfg, sensor_init_time)
-        for sid, cfg in PRODUCTION_CONFIG["sensors"].items()
-    }
-    return resolver, areas, sensors, detector, now
+    replay.fire("binary_sensor.entrance_motion", True, 0.0)
+    replay.fire("binary_sensor.corridor_1_motion", True, 2.0)
+    replay.fire("binary_sensor.study_motion", True, 3.0)
+    assert replay.room("study").confirmed is False
+
+    replay.fire("binary_sensor.entrance_motion", False, 5.0)
+    replay.fire("binary_sensor.corridor_1_motion", False, 7.0)
+    replay.fire("binary_sensor.study_motion", False, 8.0)
+    replay.fire("binary_sensor.study_motion", True, 15.0)
+    replay.fire("binary_sensor.study_motion", False, 20.0)
+
+    assert replay.room("study").confirmed is True
+    assert replay.areas["study"].occupancy == 1
+    return 45.0
 
 
-def _seed_person_in_kitchen(resolver, areas, sensors, detector, now):
-    """Bootstrap: person enters via entrance and walks to kitchen.
+def _seed_person_in_kitchen(replay: Replay) -> float:
+    """Walk somebody in through the entrance and into the open plan.
 
-    Returns timestamp for next sequence (well past ADJACENT_ACTIVITY_WINDOW).
+    Returns the offset at which the next sequence can start.
     """
-    _fire(
-        resolver, sensors, areas, "binary_sensor.entrance_motion", True, now, detector
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        True,
-        now + 3.7,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        False,
-        now + 5.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        True,
-        now + 4.5,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        False,
-        now + 10.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        False,
-        now + 11.0,
-        detector,
-    )
+    replay.fire("binary_sensor.entrance_motion", True, 0.0)
+    replay.fire("binary_sensor.kitchen_motion", True, 3.7)
+    replay.fire("binary_sensor.dining_room_motion", True, 4.5)
+    replay.fire("binary_sensor.entrance_motion", False, 5.0)
+    replay.fire("binary_sensor.kitchen_motion", False, 10.0)
+    replay.fire("binary_sensor.dining_room_motion", False, 11.0)
 
-    assert areas["kitchen"].occupancy == 1 or areas["dining_room"].occupancy == 1
-    assert _open_plan_occupancy(areas) >= 1
-    assert _total_occupancy(areas) >= 1
-    # Return time well past any activity window so subsequent events start clean
-    return now + 30.0
-
-
-def _seed_person_in_study(resolver, areas, sensors, detector, now):
-    """Bootstrap: person enters via entrance and walks to study.
-
-    Returns timestamp for next sequence (well past ADJACENT_ACTIVITY_WINDOW).
-    """
-    _fire(
-        resolver, sensors, areas, "binary_sensor.entrance_motion", True, now, detector
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        True,
-        now + 2.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.study_motion",
-        True,
-        now + 3.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        False,
-        now + 5.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        False,
-        now + 7.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.study_motion",
-        False,
-        now + 12.0,
-        detector,
-    )
-
-    assert areas["study"].occupancy == 1
-    assert _total_occupancy(areas) >= 1
-    # Return time well past any activity window AND retention cooldown
-    # (study retained at now+12, cooldown=30s, so need > now+42)
-    return now + 45.0
-
-
-# ==================================================================
-# TEST 1: The 18:12 walk — study → corridor_1 → entrance → kitchen
-#
-# Person walks from study through corridor, entrance, into kitchen.
-# Key assertion: person arrives in kitchen with open-plan occupancy
-# in every room with positive evidence.
-# ==================================================================
+    # The kitchen edge is 3.7 s after the entrance edge, too slow to be spill.
+    # The dining edge is 0.8 s after the kitchen edge, which is the overlap.
+    assert replay.room("kitchen").confirmed is True
+    assert replay.room("dining_room").confirmed is False
+    assert replay.open_plan_occupancy() >= 1
+    return 30.0
 
 
 def test_1812_walk_study_to_kitchen():
-    """Replay the 18:12 walk from study to kitchen.
+    """Replay the 18:12 walk: study, corridor_1, entrance, kitchen.
 
-    The critical invariant: positive open-plan and corridor evidence must
-    never be converted into a false vacancy.
+    Every room the walk passed through releases at its own deadline, each for
+    the reason the design gives it. Only the room the walk ended in keeps its
+    occupancy.
     """
-    resolver, areas, sensors, detector, now = _make_system()
-    t = _seed_person_in_study(resolver, areas, sensors, detector, now)
+    replay = Replay()
+    t = _seed_person_in_study(replay)
 
-    # -- The walk: study → corridor_1 → entrance → kitchen --
+    replay.fire("binary_sensor.corridor_1_motion", True, t)
+    replay.fire("binary_sensor.entrance_motion", True, t + 3.7)
+    replay.fire("binary_sensor.corridor_1_motion", False, t + 5.0)
+    replay.fire("binary_sensor.kitchen_motion", True, t + 7.4)
+    replay.fire("binary_sensor.dining_room_motion", True, t + 8.2)
+    replay.fire("binary_sensor.entrance_motion", False, t + 8.7)
+    replay.fire("binary_sensor.dining_room_motion", False, t + 13.0)
+    replay.fire("binary_sensor.kitchen_motion", False, t + 14.0)
 
-    # Corridor motion must not evict a potentially still-occupied study.
-    _fire(
-        resolver, sensors, areas, "binary_sensor.corridor_1_motion", True, t, detector
-    )
-    assert areas["corridor_1"].occupancy == 1
-    assert areas["study"].occupancy == 1
+    # Mid-walk every room is still held, because no deadline has come due.
+    assert {"study", "corridor_1", "entrance"} <= replay.occupied()
 
-    # corridor_1 OFF after 5s KNX delay
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        False,
-        t + 5.0,
-        detector,
-    )
+    # The person stays in the kitchen and keeps moving there.
+    for offset in (60.0, 120.0, 180.0):
+        replay.tick(t + offset - 1)
+        replay.fire("binary_sensor.kitchen_motion", True, t + offset)
+        replay.fire("binary_sensor.kitchen_motion", False, t + offset + 5.0)
 
-    # Entrance ON (person walks to entrance, +3.7s from corridor)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        True,
-        t + 3.7,
-        detector,
-    )
-    assert areas["entrance"].occupancy == 1
+    replay.tick(t + 300.0)
 
-    # Entrance OFF after 5s
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        False,
-        t + 8.7,
-        detector,
-    )
-
-    # Kitchen ON (+3.7s from entrance ON)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        True,
-        t + 7.4,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1
-
-    # Dining ON (+0.8s overlap)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        True,
-        t + 8.2,
-        detector,
-    )
-
-    # CHECKPOINT: open-plan occupancy remains present.
-    assert _open_plan_occupancy(areas) >= 1, (
-        f"Open plan: K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy} "
-        f"L={areas['living'].occupancy}"
-    )
-
-
-# ==================================================================
-# TEST 2: Kitchen/dining oscillation — the inflation factory
-#
-# Person stands in kitchen. Kitchen and dining sensors alternate
-# ON/OFF due to overlapping fields of view. In production this
-# drove a single room count to 7. Per-room state must remain boolean.
-# ==================================================================
-
-
-def test_kitchen_dining_oscillation_production():
-    """Replay K/DR oscillation that caused DR@7 in production.
-
-    The oscillation pattern: K ON → DR ON (overlap) → K OFF → K ON →
-    DR OFF → DR ON → repeat. Each OFF/ON cycle used to create a phantom
-    occupant. Per-room state remains boolean while possible rooms stay occupied.
-    """
-    resolver, areas, sensors, detector, now = _make_system()
-    t = _seed_person_in_kitchen(resolver, areas, sensors, detector, now)
-
-    # Start kitchen cycling
-    _fire(resolver, sensors, areas, "binary_sensor.kitchen_motion", True, t, detector)
-
-    # -- Oscillation: exact production pattern --
-    # Cycle 1: DR ON → K OFF → K ON → DR OFF
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        True,
-        t + 0.8,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1
-
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        False,
-        t + 5.0,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1, (
-        f"K OFF inflation! K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy}"
-    )
-
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        True,
-        t + 8.0,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1
-
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        False,
-        t + 9.0,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1
-
-    # Cycle 2
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        True,
-        t + 12.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        False,
-        t + 13.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        True,
-        t + 16.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        False,
-        t + 17.0,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1
-
-    # Cycle 3-10 (compressed)
-    t_c = t + 20.0
-    for cycle in range(8):
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.dining_room_motion",
-            True,
-            t_c,
-            detector,
-        )
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.kitchen_motion",
-            False,
-            t_c + 5.0,
-            detector,
-        )
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.kitchen_motion",
-            True,
-            t_c + 8.0,
-            detector,
-        )
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.dining_room_motion",
-            False,
-            t_c + 9.0,
-            detector,
-        )
-
-        assert _open_plan_occupancy(areas) >= 1, (
-            f"Inflation at cycle {cycle + 3}: K={areas['kitchen'].occupancy} "
-            f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
-        )
-        t_c += 10.0
-
-    # Triple fire pattern: DR → K → L
-    _fire(
-        resolver, sensors, areas, "binary_sensor.kitchen_motion", False, t_c, detector
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        True,
-        t_c + 3.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        True,
-        t_c + 3.2,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.living_room_motion",
-        True,
-        t_c + 6.0,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1, (
-        f"Triple fire: K={areas['kitchen'].occupancy} "
-        f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
-    )
-
-    # All off
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.living_room_motion",
-        False,
-        t_c + 12.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        False,
-        t_c + 13.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        False,
-        t_c + 14.0,
-        detector,
-    )
-
-    assert _open_plan_occupancy(areas) >= 1
-    assert _total_occupancy(areas) >= 1
-
-
-# ==================================================================
-# TEST 2b: Guest-room first motion from open-plan area.
-#
-# Production: guest_room_motion fired while kitchen/dining/living were
-# active, but entrance was off and last fired 277.6s earlier. The first
-# guest-room pulse must be accepted; otherwise lights wait for the
-# persistent-activation fallback.
-# ==================================================================
-
-
-def test_guest_room_first_motion_accepts_recent_entrance_path():
-    """Guest room should not wait for a second KNX pulse when entrance is stale but recent."""
-    resolver, areas, sensors, detector, now = _make_system()
-
-    # Person entered through entrance and reached open-plan.
-    _fire(
-        resolver, sensors, areas, "binary_sensor.entrance_motion", True, now, detector
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        True,
-        now + 3.7,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        True,
-        now + 4.5,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.living_room_motion",
-        True,
-        now + 5.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        False,
-        now + 5.0,
-        detector,
-    )
-    assert _open_plan_occupancy(areas) >= 1
-
-    # Same shape as the observed failure: guest motion happens after bootstrap
-    # expired, entrance is off, and entrance last ON is still within 5 minutes.
-    guest_time = now + 277.6
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.guest_room_motion",
-        True,
-        guest_time,
-        detector,
-    )
-
-    assert areas["guest_room"].occupancy == 1
-    assert _open_plan_occupancy(areas) >= 1
-    assert _total_occupancy(areas) >= 2
-    assert not [
-        warning
-        for warning in detector.get_warnings()
-        if warning.area == "guest_room" and "no_plausible_source" in warning.message
-    ]
-
-
-# ==================================================================
-# TEST 3: The 18:40 return walk — kitchen → entrance → corridor_1
-#          → corridor_2 → bedroom_1
-#
-# Person walks from open-plan area back through corridors to bedroom_1.
-# Corridor_1 spills into study (+1.4s) and bedroom_2 (+0.06s).
-# Key assertion: person ends up in bedroom_1.
-# ==================================================================
+    # The study released because corridor_1 fired inside its trail window,
+    # and the corridor and the entrance released the same way as the walk
+    # moved on. Only the room the walk ended in keeps its occupancy.
+    assert replay.room("study").state == STATE_VACANT
+    assert replay.room("study").reason == "departure_trail"
+    assert replay.room("corridor_1").state == STATE_VACANT
+    assert replay.room("entrance").reason == "departure_trail"
+    assert replay.occupied() == {"kitchen"}
+    assert replay.room("kitchen").state == STATE_RETAINED
 
 
 def test_1840_return_walk_kitchen_to_bedroom():
-    """Replay the 18:40 return walk from kitchen to bedroom_1.
+    """Replay the 18:40 return walk: kitchen to bedroom_1 through both corridors.
 
-    The critical invariant: person ends in bedroom_1 with occupancy=1.
-    During transit, corridor spill into study and bedroom_2 may create
-    temporary claims, but the person must arrive correctly.
+    The bedroom edge lands 0.2 s after corridor_2's, which is the measured
+    spill. The person moving again once they are in the room confirms it.
     """
-    resolver, areas, sensors, detector, now = _make_system()
-    t = _seed_person_in_kitchen(resolver, areas, sensors, detector, now)
+    replay = Replay()
+    t = _seed_person_in_kitchen(replay)
 
-    # Person starts moving: kitchen ON, then walks to entrance
-    _fire(resolver, sensors, areas, "binary_sensor.kitchen_motion", True, t, detector)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        True,
-        t + 3.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        False,
-        t + 5.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        False,
-        t + 8.0,
-        detector,
-    )
+    replay.fire("binary_sensor.kitchen_motion", True, t)
+    replay.fire("binary_sensor.entrance_motion", True, t + 3.0)
+    replay.fire("binary_sensor.kitchen_motion", False, t + 5.0)
+    replay.fire("binary_sensor.entrance_motion", False, t + 8.0)
 
-    # Wait for activity windows to expire
-    t_walk = t + 20.0
+    walk = t + 20.0
+    replay.fire("binary_sensor.corridor_1_motion", True, walk)
+    replay.fire("binary_sensor.corridor_2_motion", True, walk + 4.4)
+    replay.fire("binary_sensor.bedroom_1_motion", True, walk + 4.6)
+    assert replay.room("bedroom_1").confirmed is False
 
-    # -- The corridor walk (clean, no spill for simplicity) --
-    # corridor_1 ON
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        True,
-        t_walk,
-        detector,
-    )
-    assert areas["corridor_1"].occupancy == 1
+    replay.fire("binary_sensor.corridor_1_motion", False, walk + 5.0)
+    replay.fire("binary_sensor.corridor_2_motion", False, walk + 10.0)
+    replay.fire("binary_sensor.bedroom_1_motion", False, walk + 25.0)
+    replay.fire("binary_sensor.bedroom_1_motion", True, walk + 30.0)
+    replay.fire("binary_sensor.bedroom_1_motion", False, walk + 35.0)
 
-    # corridor_1 OFF
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        False,
-        t_walk + 5.0,
-        detector,
-    )
+    assert replay.room("bedroom_1").confirmed is True
 
-    # corridor_2 ON (+4.4s from corridor_1)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_2_motion",
-        True,
-        t_walk + 4.4,
-        detector,
-    )
-    assert areas["corridor_2"].occupancy == 1
+    replay.tick(walk + 35.0 + HOLD)
 
-    # bedroom_1 ON (+0.2s from corridor_2)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.bedroom_1_motion",
-        True,
-        t_walk + 4.6,
-        detector,
-    )
-
-    # corridor_2 OFF
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_2_motion",
-        False,
-        t_walk + 10.0,
-        detector,
-    )
-
-    # bedroom_1 OFF (person still there, sensor cycling)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.bedroom_1_motion",
-        False,
-        t_walk + 25.0,
-        detector,
-    )
-    assert areas["bedroom_1"].occupancy == 1, "Person should stay in bedroom_1"
-
-    # bedroom_1 ON (re-trigger)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.bedroom_1_motion",
-        True,
-        t_walk + 30.0,
-        detector,
-    )
-    assert areas["bedroom_1"].occupancy == 1
-
-    # CHECKPOINT: person is in bedroom_1
-    assert areas["bedroom_1"].occupancy == 1, (
-        f"Person not in bedroom_1. Occupied: {_occupied_areas(areas)}"
-    )
+    assert replay.occupied() == {"bedroom_1"}
+    assert replay.room("bedroom_1").state == STATE_RETAINED
+    # Nothing fired after corridor_2, so it released on being a transition
+    # room rather than on a trail. Corridors never retain either way.
+    assert replay.room("corridor_1").state == STATE_VACANT
+    assert replay.room("corridor_2").reason == "transition_room"
+    assert replay.room("kitchen").reason == "departure_trail"
 
 
-# ==================================================================
-# TEST 4: Extended oscillation — 20 cycles of K/DR alternation.
-#
-# Person standing in kitchen for ~10 minutes. In production,
-# 10 minutes drove counts to K@6 DR@7. With open-plan groups,
-# must remain boolean without dropping positive evidence.
-# ==================================================================
+def test_a_sleeping_room_is_bounded_by_its_ceiling():
+    """A bedroom held with no departure trail still resolves on its own."""
+    replay = Replay()
+    replay.fire("binary_sensor.bedroom_1_motion", True, 0.0)
+    replay.fire("binary_sensor.bedroom_1_motion", False, 5.0)
+
+    replay.tick(5.0 + HOLD)
+    assert replay.room("bedroom_1").state == STATE_RETAINED
+
+    replay.tick(SLEEPING_CEILING)
+    assert replay.room("bedroom_1").state == STATE_RETAINED
+
+    replay.tick(5.0 + SLEEPING_CEILING)
+    assert replay.occupied() == set()
+    assert replay.room("bedroom_1").reason == "retention_ceiling"
+
+
+# ----------------------------------------------------------------------
+# The overlapping open plan
+# ----------------------------------------------------------------------
+
+
+def test_kitchen_dining_oscillation_production():
+    """Replay the kitchen and dining oscillation that inflated counts to 7.
+
+    One person stands in the kitchen while the two overlapping detectors
+    alternate. Which room holds them is ambiguous, so the assertion is that
+    the open plan never reads empty and no room ever counts more than one.
+    """
+    replay = Replay()
+    t = _seed_person_in_kitchen(replay)
+
+    replay.fire("binary_sensor.kitchen_motion", True, t)
+    replay.fire("binary_sensor.dining_room_motion", True, t + 0.8)
+    replay.fire("binary_sensor.kitchen_motion", False, t + 5.0)
+    replay.fire("binary_sensor.kitchen_motion", True, t + 8.0)
+    replay.fire("binary_sensor.dining_room_motion", False, t + 9.0)
+
+    replay.fire("binary_sensor.dining_room_motion", True, t + 12.0)
+    replay.fire("binary_sensor.kitchen_motion", False, t + 13.0)
+    replay.fire("binary_sensor.kitchen_motion", True, t + 16.0)
+    replay.fire("binary_sensor.dining_room_motion", False, t + 17.0)
+
+    cycle_start = t + 20.0
+    for cycle in range(8):
+        replay.fire("binary_sensor.dining_room_motion", True, cycle_start)
+        replay.fire("binary_sensor.kitchen_motion", False, cycle_start + 5.0)
+        replay.fire("binary_sensor.kitchen_motion", True, cycle_start + 8.0)
+        replay.fire("binary_sensor.dining_room_motion", False, cycle_start + 9.0)
+        replay.tick(cycle_start + 9.5)
+
+        assert replay.open_plan_occupancy() >= 1, f"open plan empty at cycle {cycle}"
+        cycle_start += 10.0
+
+    # The triple fire: dining, kitchen, and living within seconds.
+    replay.fire("binary_sensor.kitchen_motion", False, cycle_start)
+    replay.fire("binary_sensor.dining_room_motion", True, cycle_start + 3.0)
+    replay.fire("binary_sensor.kitchen_motion", True, cycle_start + 3.2)
+    replay.fire("binary_sensor.living_room_motion", True, cycle_start + 6.0)
+    assert replay.open_plan_occupancy() >= 1
+
+    replay.fire("binary_sensor.living_room_motion", False, cycle_start + 12.0)
+    replay.fire("binary_sensor.dining_room_motion", False, cycle_start + 13.0)
+    replay.fire("binary_sensor.kitchen_motion", False, cycle_start + 14.0)
+
+    # The room that fired last has no exit edge after its own activity, so
+    # the group keeps the person even once every detector is quiet.
+    replay.tick(cycle_start + 14.0 + HOLD)
+    assert replay.open_plan_occupancy() >= 1
 
 
 def test_extended_oscillation_20_cycles():
-    """20 cycles of kitchen/dining ON/OFF oscillation.
+    """Twenty cycles of the same alternation, then a long silence.
 
-    Each cycle: K ON → DR ON (+0.8s) → K OFF (+5s) → DR OFF (+1s) → gap(3s)
-    This mimics the real production pattern that caused runaway inflation.
+    Standing still for ten minutes used to drive the counts to K@6 DR@7.
     """
-    resolver, areas, sensors, detector, now = _make_system()
-    t = _seed_person_in_kitchen(resolver, areas, sensors, detector, now)
+    replay = Replay()
+    t = _seed_person_in_kitchen(replay)
 
     for cycle in range(20):
-        # Kitchen ON
-        _fire(
-            resolver, sensors, areas, "binary_sensor.kitchen_motion", True, t, detector
-        )
-        # Dining ON (overlap, +0.8s)
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.dining_room_motion",
-            True,
-            t + 0.8,
-            detector,
-        )
-        # Kitchen OFF (+5s KNX delay)
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.kitchen_motion",
-            False,
-            t + 5.0,
-            detector,
-        )
-        # Dining OFF (+1s after kitchen OFF)
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.dining_room_motion",
-            False,
-            t + 6.0,
-            detector,
-        )
+        replay.fire("binary_sensor.kitchen_motion", True, t)
+        replay.fire("binary_sensor.dining_room_motion", True, t + 0.8)
+        replay.fire("binary_sensor.kitchen_motion", False, t + 5.0)
+        replay.fire("binary_sensor.dining_room_motion", False, t + 6.0)
+        replay.tick(t + 9.0)
 
-        assert _open_plan_occupancy(areas) >= 1, (
-            f"Inflation at cycle {cycle}: "
-            f"K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy} "
-            f"L={areas['living'].occupancy} total={_total_occupancy(areas)}"
-        )
+        assert replay.open_plan_occupancy() >= 1, f"open plan empty at cycle {cycle}"
+        assert replay.open_plan_occupancy() <= len(OPEN_PLAN)
+        t += 10.0
 
-        t += 10.0  # 10s per cycle
+    last_off = t - 10.0 + 6.0
 
-    # After 20 cycles, open-plan occupancy remains present.
-    assert _open_plan_occupancy(areas) >= 1
-    assert _total_occupancy(areas) >= 1
+    # Which room of the pair the deadline leaves occupied depends on which
+    # detector fired last, so the assertion is bounded: the group is still
+    # occupied the moment the detectors go quiet, and nothing survives the
+    # living-room ceiling.
+    replay.tick(last_off + 1.0)
+    assert replay.open_plan_occupancy() >= 1
+
+    replay.tick(last_off + LIVING_CEILING)
+    assert replay.open_plan_occupancy() == 0
+    assert replay.occupied() == set()
 
 
-# ==================================================================
-# TEST 5: Study phantom rejection during kitchen occupancy.
-#
-# Production: 19 phantom triggers in study while person was in
-# kitchen (18:13-18:36). All must be rejected — study has no
-# occupied adjacent neighbor (corridor_1 is empty and stale).
-# ==================================================================
+def test_guest_room_first_motion_is_accepted_at_once():
+    """The first guest-room pulse counts, with the open plan still busy.
+
+    Recorded shape: guest_room_motion fires while the open plan is active and
+    the entrance last fired 277.6 s earlier. One person is in the open plan,
+    another walks into the guest toilet.
+    """
+    replay = Replay()
+    replay.fire("binary_sensor.entrance_motion", True, 0.0)
+    replay.fire("binary_sensor.kitchen_motion", True, 3.7)
+    replay.fire("binary_sensor.dining_room_motion", True, 4.5)
+    replay.fire("binary_sensor.living_room_motion", True, 5.0)
+    replay.fire("binary_sensor.entrance_motion", False, 5.2)
+
+    # The first person keeps the open plan busy for the next five minutes.
+    for offset in range(10, 270, 30):
+        replay.fire("binary_sensor.kitchen_motion", False, offset)
+        replay.fire("binary_sensor.dining_room_motion", False, offset + 1.0)
+        replay.fire("binary_sensor.living_room_motion", False, offset + 2.0)
+        replay.fire("binary_sensor.kitchen_motion", True, offset + 10.0)
+        replay.tick(offset + 12.0)
+
+    guest_time = 277.6
+    replay.fire("binary_sensor.guest_room_motion", True, guest_time)
+
+    # The entrance went quiet minutes ago, so this cannot be its spill.
+    assert replay.areas["guest_room"].occupancy == 1
+    assert replay.room("guest_room").confirmed is True
+    assert replay.room("guest_room").reason == "own_motion"
+    assert replay.open_plan_occupancy() >= 1
+    assert len(replay.occupied()) >= 2
+    assert not [
+        warning
+        for warning in replay.detector.get_warnings()
+        if warning.area == "guest_room" and "no_plausible_source" in warning.message
+    ]
+
+    # Nobody left the guest toilet, so it keeps its occupancy.
+    replay.fire("binary_sensor.guest_room_motion", False, guest_time + 5.0)
+    replay.tick(guest_time + 5.0 + HOLD)
+    assert replay.room("guest_room").state == STATE_RETAINED
 
 
 def test_study_persistent_activation_accepted():
-    """Study sensor fires repeatedly — accepted as real person via persistent activation.
+    """Nineteen study pulses over twenty minutes are one person, not phantoms.
 
-    19 triggers over 20 minutes is clearly a person sitting in the study,
-    not a phantom. After 3+ activations within 5 minutes, the persistent
-    activation check accepts it. Total occupancy becomes 2 (kitchen + study).
+    The gaps between pulses run to six minutes, which is far longer than the
+    hold. The room stays occupied throughout because no exit ever fired.
     """
-    resolver, areas, sensors, detector, now = _make_system()
-    t = _seed_person_in_kitchen(resolver, areas, sensors, detector, now)
+    replay = Replay()
+    t = _seed_person_in_kitchen(replay)
 
-    # Fire repeated triggers at study — intervals from production
-    phantom_offsets = [
+    offsets = [
         0.0,
         35.2,
         75.2,
@@ -1107,247 +506,184 @@ def test_study_persistent_activation_accepted():
         847.2,
         1219.2,
     ]
-    for i, offset in enumerate(phantom_offsets):
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.study_motion",
-            True,
-            t + offset,
-            detector,
-        )
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.study_motion",
-            False,
-            t + offset + 5.0,
-            detector,
+    for offset in offsets:
+        replay.fire("binary_sensor.study_motion", True, t + offset)
+        assert replay.room("study").state == STATE_OCCUPIED
+        replay.fire("binary_sensor.study_motion", False, t + offset + 5.0)
+        # Half way to the next pulse the room must still read occupied.
+        replay.tick(t + offset + 5.0 + HOLD)
+        assert replay.areas["study"].occupancy == 1, (
+            f"study went vacant during the silence after {offset:.1f} s"
         )
 
-    # Study gets accepted via persistent activation but may be cleared
-    # by the 2-minute inactivity cleanup between sparse triggers.
-    # Persistent valid activity must not be rejected by a global room cap.
-    assert areas["study"].occupancy == 1
+    last = t + offsets[-1] + 5.0
+    assert replay.room("study").state == STATE_RETAINED
+    assert replay.room("study").reason == "no_exit_trail"
+
+    # With nobody ever using corridor_1, the ceiling is what ends it.
+    replay.tick(last + LIVING_CEILING)
+    assert replay.areas["study"].occupancy == 0
+    assert replay.room("study").reason == "retention_ceiling"
 
 
-# ==================================================================
-# TEST 6: Full end-to-end — walk to kitchen + oscillation + return.
-#
-# Three production sequences back to back:
-# 1. Person in study → walks to kitchen (no spill — clean walk)
-# 2. K/DR oscillation for 5 cycles
-# 3. Person walks from kitchen back to bedroom_1
-# Open-plan must never inflate. Final position: bedroom_1.
-# ==================================================================
+# ----------------------------------------------------------------------
+# End to end
+# ----------------------------------------------------------------------
 
 
 def test_full_production_sequence():
-    """Full end-to-end: study → kitchen → oscillation → bedroom_1."""
-    resolver, areas, sensors, detector, now = _make_system()
-    t = _seed_person_in_study(resolver, areas, sensors, detector, now)
+    """Study to kitchen, ten minutes of oscillation, then back to bedroom_1."""
+    replay = Replay()
+    t = _seed_person_in_study(replay)
 
-    # ---- Phase 1: Walk study → corridor_1 → entrance → kitchen ----
-    _fire(
-        resolver, sensors, areas, "binary_sensor.corridor_1_motion", True, t, detector
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        False,
-        t + 5.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        True,
-        t + 3.7,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        False,
-        t + 8.7,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        True,
-        t + 7.4,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        True,
-        t + 8.2,
-        detector,
-    )
+    # Phase 1: study, corridor_1, entrance, kitchen.
+    replay.fire("binary_sensor.corridor_1_motion", True, t)
+    replay.fire("binary_sensor.entrance_motion", True, t + 3.7)
+    replay.fire("binary_sensor.corridor_1_motion", False, t + 5.0)
+    replay.fire("binary_sensor.kitchen_motion", True, t + 7.4)
+    replay.fire("binary_sensor.dining_room_motion", True, t + 8.2)
+    replay.fire("binary_sensor.entrance_motion", False, t + 8.7)
+    assert replay.open_plan_occupancy() >= 1
 
-    assert _open_plan_occupancy(areas) >= 1, (
-        f"Phase 1: K={areas['kitchen'].occupancy} DR={areas['dining_room'].occupancy}"
-    )
-
-    # ---- Phase 2: K/DR oscillation (5 cycles) ----
-    # Wait past activity window from the walk
+    # Phase 2: the overlapping detectors alternate for five cycles.
     t2 = t + 25.0
     for cycle in range(5):
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.kitchen_motion",
-            False,
-            t2,
-            detector,
-        )
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.dining_room_motion",
-            False,
-            t2 + 1.0,
-            detector,
-        )
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.kitchen_motion",
-            True,
-            t2 + 4.0,
-            detector,
-        )
-        _fire(
-            resolver,
-            sensors,
-            areas,
-            "binary_sensor.dining_room_motion",
-            True,
-            t2 + 4.8,
-            detector,
-        )
+        replay.fire("binary_sensor.kitchen_motion", False, t2)
+        replay.fire("binary_sensor.dining_room_motion", False, t2 + 1.0)
+        replay.fire("binary_sensor.kitchen_motion", True, t2 + 4.0)
+        replay.fire("binary_sensor.dining_room_motion", True, t2 + 4.8)
+        replay.tick(t2 + 9.0)
+        assert replay.open_plan_occupancy() >= 1, f"open plan empty at cycle {cycle}"
         t2 += 10.0
 
-        assert _open_plan_occupancy(areas) >= 1, (
-            f"Phase 2 cycle {cycle}: K={areas['kitchen'].occupancy} "
-            f"DR={areas['dining_room'].occupancy} L={areas['living'].occupancy}"
-        )
-
-    # ---- Phase 3: Walk kitchen → entrance → corridor_1 → corridor_2 → bedroom_1 ----
-    # Wait past activity window
+    # Phase 3: out through the entrance and both corridors to bedroom_1.
     t3 = t2 + 15.0
+    replay.fire("binary_sensor.entrance_motion", True, t3)
+    replay.fire("binary_sensor.kitchen_motion", False, t3 + 2.0)
+    replay.fire("binary_sensor.dining_room_motion", False, t3 + 2.5)
+    replay.fire("binary_sensor.corridor_1_motion", True, t3 + 4.5)
+    replay.fire("binary_sensor.entrance_motion", False, t3 + 5.0)
+    replay.fire("binary_sensor.corridor_2_motion", True, t3 + 8.9)
+    replay.fire("binary_sensor.bedroom_1_motion", True, t3 + 9.1)
+    replay.fire("binary_sensor.corridor_1_motion", False, t3 + 9.5)
+    replay.fire("binary_sensor.corridor_2_motion", False, t3 + 14.0)
+    replay.fire("binary_sensor.bedroom_1_motion", False, t3 + 25.0)
+    replay.fire("binary_sensor.bedroom_1_motion", True, t3 + 30.0)
+    replay.fire("binary_sensor.bedroom_1_motion", False, t3 + 35.0)
 
-    # Entrance ON (person leaving kitchen area)
-    _fire(resolver, sensors, areas, "binary_sensor.entrance_motion", True, t3, detector)
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.kitchen_motion",
-        False,
-        t3 + 2.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.dining_room_motion",
-        False,
-        t3 + 2.5,
-        detector,
-    )
+    replay.tick(t3 + 35.0 + HOLD)
 
-    # corridor_1 ON
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        True,
-        t3 + 4.5,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.entrance_motion",
-        False,
-        t3 + 5.0,
-        detector,
-    )
+    assert replay.occupied() == {"bedroom_1"}
+    assert replay.room("bedroom_1").state == STATE_RETAINED
 
-    # corridor_2 ON, bedroom_1 ON, corridor_1 OFF — in timestamp order
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_2_motion",
-        True,
-        t3 + 8.9,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.bedroom_1_motion",
-        True,
-        t3 + 9.1,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_1_motion",
-        False,
-        t3 + 9.5,
-        detector,
+
+def test_no_room_stays_occupied_for_the_whole_replay():
+    """The July regression: rooms that were ON from one month to the next.
+
+    After the full sequence, with no further events at all, every room
+    resolves within the longest retention ceiling in the house.
+    """
+    replay = Replay()
+    t = _seed_person_in_kitchen(replay)
+    replay.fire("binary_sensor.entrance_motion", True, t)
+    replay.fire("binary_sensor.corridor_1_motion", True, t + 4.0)
+    replay.fire("binary_sensor.entrance_motion", False, t + 5.0)
+    replay.fire("binary_sensor.corridor_2_motion", True, t + 8.0)
+    replay.fire("binary_sensor.corridor_1_motion", False, t + 9.0)
+    replay.fire("binary_sensor.main_bedroom_motion", True, t + 14.0)
+    replay.fire("binary_sensor.corridor_2_motion", False, t + 15.0)
+    replay.fire("binary_sensor.main_bedroom_motion", False, t + 20.0)
+
+    replay.tick(t + 20.0 + SLEEPING_CEILING + HOLD)
+
+    assert replay.occupied() == set()
+    assert all(
+        room.state == STATE_VACANT for room in replay.resolver.engine.rooms.values()
     )
 
-    # All transit sensors OFF
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.corridor_2_motion",
-        False,
-        t3 + 14.0,
-        detector,
-    )
-    _fire(
-        resolver,
-        sensors,
-        areas,
-        "binary_sensor.bedroom_1_motion",
-        False,
-        t3 + 25.0,
-        detector,
-    )
 
-    # FINAL CHECKPOINT
-    assert areas["bedroom_1"].occupancy == 1, (
-        f"Person not in bedroom_1. Occupied: {_occupied_areas(areas)}"
-    )
-    # The previous open-plan occupancy remains pessimistically retained until
-    # departure evidence and its grace period complete.
-    assert _open_plan_occupancy(areas) >= 1
+def test_outdoor_activity_never_manufactures_an_indoor_departure():
+    """Cameras outside must not empty a room somebody is sleeping in."""
+    replay = Replay()
+    replay.fire("binary_sensor.main_bedroom_motion", True, 0.0)
+    replay.fire("binary_sensor.main_bedroom_motion", False, 5.0)
+    replay.tick(5.0 + HOLD)
+    assert replay.room("main_bedroom").state == STATE_RETAINED
+
+    for sensor_id in (
+        "binary_sensor.back_left_motion",
+        "binary_sensor.back_right_person_detected",
+        "binary_sensor.left_motion",
+    ):
+        replay.fire(sensor_id, True, 200.0)
+        replay.fire(sensor_id, False, 205.0)
+    replay.tick(300.0)
+
+    assert replay.room("main_bedroom").state == STATE_RETAINED
+    assert replay.areas["backyard"].occupancy == 0
+
+
+def test_a_dead_end_visit_inside_the_suite_is_not_a_departure():
+    """Using the ensuite or the wardrobe is not leaving the main bedroom."""
+    replay = Replay()
+    replay.fire("binary_sensor.main_bedroom_motion", True, 0.0)
+    replay.fire("binary_sensor.main_bedroom_motion", False, 5.0)
+    replay.fire("binary_sensor.main_bathroom_motion", True, 8.0)
+    replay.fire("binary_sensor.main_bathroom_motion", False, 60.0)
+    replay.fire("binary_sensor.wardrobe_motion", True, 65.0)
+    replay.fire("binary_sensor.wardrobe_motion", False, 70.0)
+
+    replay.tick(70.0 + HOLD)
+    assert replay.room("main_bedroom").state == STATE_RETAINED
+    assert {"main_bedroom", "main_bathroom", "wardrobe"} <= replay.occupied()
+
+
+def test_a_corridor_pass_never_clears_a_retained_bedroom():
+    """Somebody else walking the corridor must not evict a sleeper."""
+    replay = Replay()
+    replay.fire("binary_sensor.bedroom_1_motion", True, 0.0)
+    replay.fire("binary_sensor.bedroom_1_motion", False, 5.0)
+    replay.tick(5.0 + HOLD)
+    assert replay.room("bedroom_1").state == STATE_RETAINED
+
+    replay.fire("binary_sensor.corridor_2_motion", True, 3600.0)
+    replay.fire("binary_sensor.corridor_2_motion", False, 3605.0)
+    replay.tick(3605.0 + TRANSITION_HOLD)
+
+    assert replay.room("bedroom_1").state == STATE_RETAINED
+    assert replay.room("corridor_2").state == STATE_VACANT
+    assert replay.room("corridor_2").reason == "transition_room"
+
+
+def test_a_spilled_bedroom_entry_is_never_retained():
+    """A corridor_2 pass that spills into bedroom_2 must not hold the room.
+
+    Twenty percent of the recorded bedroom_2 edges start within 2 s of a
+    corridor_2 edge, which is too fast to be somebody walking through a door.
+    """
+    replay = Replay()
+    replay.fire("binary_sensor.corridor_2_motion", True, 0.0)
+    replay.fire("binary_sensor.bedroom_2_motion", True, 0.5)
+    assert replay.room("bedroom_2").confirmed is False
+
+    replay.fire("binary_sensor.corridor_2_motion", False, 5.0)
+    replay.fire("binary_sensor.bedroom_2_motion", False, 5.5)
+    replay.tick(5.5 + HOLD)
+
+    assert replay.areas["bedroom_2"].occupancy == 0
+    assert replay.room("bedroom_2").reason in {
+        "unconfirmed_entry",
+        "departure_trail",
+    }
+    assert replay.room("corridor_2").state == STATE_VACANT
+
+
+def test_pending_rooms_report_an_explicit_deadline():
+    """Vacancy has to be able to happen with no further sensor events."""
+    replay = Replay()
+    replay.fire("binary_sensor.utility_room_motion", True, 0.0)
+    replay.fire("binary_sensor.utility_room_motion", False, 5.0)
+
+    room = replay.room("utility_room")
+    assert room.state == STATE_PENDING
+    assert room.deadline == pytest.approx(replay.start + 5.0 + HOLD)

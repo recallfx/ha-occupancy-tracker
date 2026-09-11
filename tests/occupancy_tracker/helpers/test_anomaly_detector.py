@@ -229,6 +229,52 @@ class TestAnomalyDetector:
         warnings = detector.get_warnings()
         assert len(warnings) == 1
 
+    def test_extended_occupancy_warning_resolves_when_motion_returns(self):
+        """Warnings describe current predicates rather than stale history."""
+        detector = AnomalyDetector({"areas": {}, "adjacency": {}, "sensors": {}})
+        timestamp = time.time()
+        area = AreaState("office", {"name": "Office"})
+        _set_occupancy(area, 1)
+        area.last_motion = timestamp - (13 * 3600)
+
+        detector.check_timeouts({"office": area}, timestamp)
+        warning = detector.get_warnings()[0]
+        assert warning.type == "extended_occupancy"
+
+        area.record_motion(timestamp + 1)
+        detector.check_timeouts({"office": area}, timestamp + 2)
+
+        assert warning.is_active is False
+        assert detector.get_warnings() == []
+
+    def test_sticky_safety_latch_is_not_a_plausible_motion_source(self):
+        """Possible presence cannot explain a new unexplained activation forever."""
+        timestamp = 10_000.0
+        config = {
+            "areas": {"hall": {}, "room": {}},
+            "adjacency": {"hall": ["room"]},
+            "sensors": {},
+        }
+        detector = AnomalyDetector(config)
+        areas = {
+            "hall": AreaState("hall", {}),
+            "room": AreaState("room", {}),
+        }
+        areas["room"].occupied = True
+        areas["hall"].occupied = True
+        sensors = {
+            "sensor.room": SensorState(
+                "sensor.room", {"area": "room", "type": "motion"}, 0
+            )
+        }
+        sensors["sensor.room"].update_state(True, timestamp)
+
+        detector.report_unexpected_active_areas(
+            timestamp, areas, sensors, first_activation_time=timestamp - 1_000
+        )
+
+        assert any(w.type == "unexpected_motion" for w in detector.get_warnings())
+
     def test_check_timeouts_skips_unknown_inactivity_duration(self):
         """Restored occupancy without a motion timestamp is not infinite inactivity."""
         detector = AnomalyDetector({"areas": {}, "adjacency": {}, "sensors": {}})
@@ -596,14 +642,19 @@ class TestPhantomOccupancyCleanup:
         areas["hallway"].last_motion = self.BASE_TIME - 12000
         areas["kitchen"].last_motion = self.BASE_TIME - 3600
 
-        # Door opened 10 min ago
+        # Door opened 10 min ago; area-level evidence is restart-safe.
         sensors["sensor.hallway_door"].update_state(True, self.BASE_TIME - 600)
+        areas["hallway"].record_contact(self.BASE_TIME - 600, is_open=True)
 
         detector.check_timeouts(
             areas, self.BASE_TIME, sensors=sensors, freshness_fn=self._low_probability
         )
 
         assert areas["hallway"].occupancy == 1
+        assert not any(
+            warning.type == "phantom_occupancy_suspected" and warning.area == "hallway"
+            for warning in detector.get_warnings()
+        )
 
     def test_exit_capable_timeout_is_diagnostic_only(self):
         """Exit-capable inactivity warns without mutating occupancy."""

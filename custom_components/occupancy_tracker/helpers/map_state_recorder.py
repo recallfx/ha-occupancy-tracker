@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Optional
 
 from .area_state import AreaState
@@ -17,6 +17,9 @@ class MapSnapshot:
     description: Optional[str]
     areas: Dict[str, Dict[str, Any]]
     sensors: Dict[str, Dict[str, Any]]
+    # Per-room engine state. Only a restore snapshot carries it, because that
+    # is the one state a bounded history cannot re-derive from its events.
+    rooms: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 class MapStateRecorder:
@@ -117,20 +120,21 @@ class MapStateRecorder:
         self.last_event_snapshot_time = timestamp
         return snapshot
 
-    def record_restore_event(
+    def record_occupancy_restore(
         self,
         timestamp: float,
-        area_ids: list[str],
+        rooms: Dict[str, Dict[str, Any]],
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
     ) -> MapSnapshot:
-        """Record restored persistent occupancy for deterministic replay."""
+        """Record restored per-room state so a replay can reproduce it."""
         snapshot = self._build_snapshot(
             timestamp=timestamp,
             event_type="restore",
-            description=f"restore:{','.join(sorted(area_ids))}",
+            description="restore",
             areas=areas,
             sensors=sensors,
+            rooms=rooms,
         )
         self.last_snapshot_time = timestamp
         self.last_event_snapshot_time = timestamp
@@ -189,6 +193,7 @@ class MapStateRecorder:
         description: Optional[str],
         areas: Dict[str, AreaState],
         sensors: Dict[str, SensorState],
+        rooms: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> MapSnapshot:
         snapshot = MapSnapshot(
             timestamp=timestamp,
@@ -196,6 +201,7 @@ class MapStateRecorder:
             description=description,
             areas=self._serialize_areas(areas),
             sensors=self._serialize_sensors(sensors),
+            rooms=dict(rooms or {}),
         )
         self.snapshots.append(snapshot)
         return snapshot
@@ -221,8 +227,10 @@ class MapStateRecorder:
                 "occupancy": area.occupancy,
                 "is_occupied": area.is_occupied,
                 "last_motion": area.last_motion,
+                "last_contact": area.last_contact,
                 "stale_since": area.stale_since,
                 "cleared_by": area.cleared_by,
+                "state_known": area.state_known,
             }
         return payload
 
@@ -234,6 +242,7 @@ class MapStateRecorder:
             payload[sensor_id] = {
                 "state": sensor.current_state,
                 "last_changed": sensor.last_changed,
+                "last_source_timestamp": sensor.last_source_timestamp,
                 "available": sensor.is_available,
                 "reliable": sensor.is_reliable,
                 "stuck": sensor.is_stuck,

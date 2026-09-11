@@ -5,6 +5,7 @@ from unittest.mock import Mock
 from homeassistant.core import HomeAssistant
 
 from custom_components.occupancy_tracker.coordinator import OccupancyCoordinator
+from custom_components.occupancy_tracker.helpers.room_profiles import ROOM_PROFILES
 
 
 def _coordinator():
@@ -24,17 +25,16 @@ def _coordinator():
     )
 
 
-def test_area_status_exposes_stale_evidence():
+def test_area_status_exposes_a_held_room():
     coordinator = _coordinator()
-    area = coordinator.areas["study"]
-    area.occupied = True
-    area.record_motion(1000.0)
-    area.stale_since = 1010.0
-    coordinator.occupancy_resolver.indoor_latched.add("study")
+    coordinator.process_sensor_event("binary_sensor.study_motion", True, 1000.0)
+    coordinator.process_sensor_event("binary_sensor.study_motion", False, 1010.0)
 
     status = coordinator.get_area_status("study")
 
-    assert status["evidence_state"] == "stale"
+    assert status["evidence_state"] == "pending"
+    assert status["reason"] == "hold"
+    assert status["deadline"] == 1010.0 + ROOM_PROFILES["default"].hold_seconds
     assert status["active_sensors"] == []
     assert status["last_positive_evidence"] == 1000.0
     assert status["stale_since"] == 1010.0
@@ -42,17 +42,18 @@ def test_area_status_exposes_stale_evidence():
 
 def test_system_status_summarizes_evidence_states():
     coordinator = _coordinator()
-    coordinator.areas["study"].occupied = True
-    coordinator.occupancy_resolver.indoor_latched.add("study")
+    coordinator.process_sensor_event("binary_sensor.study_motion", True, 1000.0)
+    coordinator.process_sensor_event("binary_sensor.study_motion", False, 1010.0)
 
     status = coordinator.get_system_status()
 
-    assert status["area_evidence"] == {"study": "stale"}
+    assert status["area_evidence"] == {"study": "pending"}
     assert status["evidence_counts"] == {
-        "active": 0,
-        "stale": 1,
-        "inferred": 0,
+        "occupied": 0,
+        "pending": 1,
+        "retained": 0,
         "vacant": 0,
+        "unknown": 0,
     }
 
 

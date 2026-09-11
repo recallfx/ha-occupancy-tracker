@@ -6,6 +6,7 @@ class AreaConfig(TypedDict, total=False):
     indoors: bool
     exit_capable: bool
     transition: bool
+    profile: Literal["transition", "default", "living", "sleeping"]
 
 
 class MotionSensorConfig(TypedDict):

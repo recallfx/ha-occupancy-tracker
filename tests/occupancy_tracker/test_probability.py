@@ -2,13 +2,7 @@ import pytest
 from unittest.mock import Mock
 from homeassistant.core import HomeAssistant
 from custom_components.occupancy_tracker.coordinator import OccupancyCoordinator
-
-
-def _set_occupancy(area, count):
-    """Set area occupancy by adding test claims."""
-    area.claims.clear()
-    for i in range(count):
-        area.claims.add(f"_test_{i}")
+from custom_components.occupancy_tracker.helpers.room_profiles import ROOM_PROFILES
 
 
 @pytest.fixture
@@ -97,7 +91,8 @@ def test_probability_is_a_compatibility_alias_for_freshness(coordinator):
     assert coordinator.get_occupancy_probability("living_room", 1061.0) == 0.9
 
 
-def test_check_timeouts_keeps_uncertain_indoor_latch():
+def test_check_timeouts_retains_a_room_with_no_departure_trail():
+    """Uncertainty is retained until the ceiling, then released."""
     hass = Mock(spec=HomeAssistant)
     now = 100000.0
     config = {
@@ -114,13 +109,38 @@ def test_check_timeouts_keeps_uncertain_indoor_latch():
         },
     }
     coordinator = OccupancyCoordinator(hass, config, store=Mock())
+    profile = ROOM_PROFILES["default"]
 
-    _set_occupancy(coordinator.areas["bathroom"], 1)
-    coordinator.areas["bathroom"].last_motion = now - 12000
-    coordinator.areas["hallway"].last_motion = now - 3600
-    coordinator.occupancy_resolver.indoor_latched.add("bathroom")
+    coordinator.process_sensor_event("sensor.bathroom_motion", True, now)
+    coordinator.process_sensor_event("sensor.bathroom_motion", False, now + 5)
+
+    # No exit fired, so the hold turns into retention.
+    coordinator.check_timeouts(now + 5 + profile.hold_seconds)
+
+    assert coordinator.areas["bathroom"].occupancy == 1
+    assert coordinator.get_room_state("bathroom")["state"] == "retained"
+
+    # The retention ceiling still bounds the room.
+    coordinator.check_timeouts(now + 5 + profile.retention_ceiling_seconds)
+
+    assert coordinator.areas["bathroom"].occupancy == 0
+    assert coordinator.get_room_state("bathroom")["reason"] == "retention_ceiling"
+
+
+def test_periodic_check_marks_long_running_on_sensor_stuck():
+    """Stuck detection cannot depend on a different sensor firing later."""
+    hass = Mock(spec=HomeAssistant)
+    now = 200_000.0
+    config = {
+        "areas": {"hall": {}},
+        "adjacency": {},
+        "sensors": {"sensor.hall": {"area": "hall", "type": "motion"}},
+    }
+    coordinator = OccupancyCoordinator(hass, config, store=Mock())
+    coordinator.process_sensor_event("sensor.hall", True, now - 25 * 3600)
 
     coordinator.check_timeouts(now)
 
-    assert coordinator.areas["bathroom"].occupancy == 1
-    assert "bathroom" in coordinator.occupancy_resolver.indoor_latched
+    assert coordinator.sensors["sensor.hall"].is_stuck is True
+    assert coordinator.sensors["sensor.hall"].is_reliable is False
+    assert any(w.type == "stuck_sensor" for w in coordinator.get_warnings())

@@ -10,6 +10,7 @@ from custom_components.occupancy_tracker.helpers.map_occupancy_resolver import (
     MapOccupancyResolver,
 )
 from custom_components.occupancy_tracker.helpers.map_state_recorder import MapSnapshot
+from custom_components.occupancy_tracker.helpers.occupancy_engine import STATE_VACANT
 from custom_components.occupancy_tracker.helpers.sensor_state import SensorState
 
 
@@ -90,8 +91,13 @@ def test_all_simultaneously_active_rooms_are_occupied():
     assert all(area.occupied for area in areas.values())
 
 
-def test_departure_trail_does_not_clear_a_possible_second_occupant():
-    """One person's movement cannot prove that nobody remains in a room."""
+def test_departure_trail_releases_the_room_at_its_deadline():
+    """An exit activation right after the room falls silent is a departure.
+
+    The accepted error is the two-person case: if one occupant leaves and
+    another stays without moving, the room reads empty until the person who
+    stayed triggers the sensor again.
+    """
     now = time.time()
     config = {
         "areas": {"bedroom": {}, "corridor": {"transition": True}, "kitchen": {}},
@@ -113,9 +119,14 @@ def test_departure_trail_does_not_clear_a_possible_second_occupant():
     _fire(resolver, areas, sensors, "s.bedroom", False, now + 5)
     _fire(resolver, areas, sensors, "s.corridor", True, now + 10)
     _fire(resolver, areas, sensors, "s.corridor", False, now + 15)
+
+    # The hold has not expired yet, so the room stays occupied for now.
+    assert areas["bedroom"].occupied
+
     _fire(resolver, areas, sensors, "s.kitchen", True, now + 200)
 
-    assert areas["bedroom"].occupied
+    assert not areas["bedroom"].occupied
+    assert resolver.engine.rooms["bedroom"].reason == "departure_trail"
 
 
 def test_long_quiet_indoor_room_is_warned_but_not_cleared():
@@ -221,4 +232,4 @@ def test_explicit_clear_survives_history_replay():
     resolver.recalculate_from_history(history, areas, sensors)
 
     assert not areas["room"].occupied
-    assert "room" not in resolver.indoor_latched
+    assert resolver.engine.rooms["room"].state == STATE_VACANT
